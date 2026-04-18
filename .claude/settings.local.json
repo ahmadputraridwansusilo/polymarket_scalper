@@ -11,7 +11,8 @@
       "Bash(python3 -m pytest test_strategy_trace.py -v)",
       "Bash(python3 *)",
       "Bash(rtk read *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "mcp__plugin_claude-mem_mcp-search__smart_outline"
     ]
   }
 }

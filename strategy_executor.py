@@ -540,6 +540,9 @@ class StrategyExecutor:
         # Gate 3: Cooldown between attempts
         now = time.monotonic()
         if now - sstate.last_entry_attempt_at < PHASE1_ENTRY_COOLDOWN:
+            market_state.phase1_detail = (
+                f"Cooldown | next={PHASE1_ENTRY_COOLDOWN - (now - sstate.last_entry_attempt_at):.1f}s"
+            )
             return
         sstate.last_entry_attempt_at = now
 
@@ -1005,6 +1008,19 @@ class StrategyExecutor:
             )
             return
 
+        # Bump size up if ratio-based size yields fewer shares than exchange minimum.
+        # Avoids silent rejection from place_limit_order's MIN_ORDER_SHARES check.
+        min_size_for_shares = math.ceil(config.MIN_ORDER_SHARES * current_price * 100) / 100.0
+        if sniper_size < min_size_for_shares:
+            if min_size_for_shares > balance:
+                market_state.phase2_status = Phase2Status.BLOCKED
+                market_state.abort_reason = (
+                    f"Sniper: need ${min_size_for_shares:.2f} for {config.MIN_ORDER_SHARES} shares"
+                    f" but balance=${balance:.2f}"
+                )
+                return
+            sniper_size = min_size_for_shares
+
         sniper_shares = sniper_size / current_price if current_price > 0 else 0.0
         sniper_payout = sniper_shares * 1.00
         expected_profit = sniper_payout - sniper_size
@@ -1056,8 +1072,6 @@ class StrategyExecutor:
             phase="PHASE3_SNIPER",
         )
 
-        sstate.phase3_sniper_fired = True
-
         if order is None:
             market_state.phase2_status = Phase2Status.ABORTED
             market_state.abort_reason = "Sniper: limit order rejected"
@@ -1067,6 +1081,8 @@ class StrategyExecutor:
                 current_price, sniper_size, snap.time_remaining,
             )
             return
+
+        sstate.phase3_sniper_fired = True
 
         sstate.phase3_order_id = order.order_id
         log.info(
