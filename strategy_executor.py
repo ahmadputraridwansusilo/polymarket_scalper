@@ -95,16 +95,15 @@ PHASE2_EMERGENCY_CLOSE_SECONDS: float = 10.0     # close losing unhedged positio
 # ---------------------------------------------------------------------------
 # Phase 3 Sniper — high-conviction near-expiry entry
 #
-# Window : 10 s < time_remaining ≤ 30 s
-# Entry  : price in [0.96, 0.99] — almost-certain-win zone
+# Window : 10 s < time_remaining ≤ 60 s
+# Entry  : price in [0.90, 0.99] — high-conviction zone
 # Size   : 15 % of bankroll (base); 20 % when OBI is very strong (≥ 0.85)
-# Order  : aggressive limit at SNIPER_LIMIT_PRICE (1.00)
-#          placed at current best_ask — fill at market, never overpay past 0.99
+# Order  : GTC limit at current best_ask — polls up to 60s for fill, then cancels
 # Momentum gate: OBI must still be strongly aligned at fire time
 #   UP  side → OBI ≥ PHASE3_MOMENTUM_OBI_STRONG (0.60)
 #   DOWN side → OBI ≤ 1 − PHASE3_MOMENTUM_OBI_STRONG (0.40)
 # ---------------------------------------------------------------------------
-PHASE3_WINDOW_START: float = 30.0                # sniper window opens at 30 s remaining
+PHASE3_WINDOW_START: float = 60.0                # sniper window opens at 60 s remaining
 PHASE3_WINDOW_END: float = 10.0                  # sniper window closes at 10 s remaining
 PHASE3_MIN_WINNING_PRICE: float = 0.90           # floor — don't enter below this
 PHASE3_MAX_WINNING_PRICE: float = 0.99           # ceiling — don't overpay past this
@@ -113,6 +112,8 @@ PHASE3_SIZE_RATIO_HIGH: float = 0.20             # 20 % when OBI is very strong
 PHASE3_SIZE_RATIO: float = PHASE3_SIZE_RATIO_BASE  # alias for test compat
 PHASE3_OBI_HIGH_THRESHOLD: float = 0.85          # OBI ≥ this → use SIZE_RATIO_HIGH
 PHASE3_MOMENTUM_OBI_STRONG: float = 0.60         # minimum OBI magnitude to confirm momentum intact
+PHASE3_LIMIT_TIMEOUT: float = 60.0              # cancel GTC limit after this many seconds if unfilled
+PHASE3_LIMIT_POLL_INTERVAL: float = 2.0         # poll interval for fill check
 
 # ---------------------------------------------------------------------------
 # Entry sizing tiers
@@ -147,6 +148,7 @@ class StrategyState:
 
     # Phase 3 sniper tracking
     phase3_sniper_fired: bool = False
+    phase3_order_id: str = ""
 
     # Dashboard
     detail: str = "-"
@@ -450,7 +452,10 @@ class StrategyExecutor:
                     down_book=down_book,
                 )
             else:
-                market_state.phase1_detail = f"Sniper already fired | t={tr:.0f}s"
+                if sstate.phase3_order_id:
+                    market_state.phase1_detail = f"Sniper limit pending | order={sstate.phase3_order_id[:8]}"
+                else:
+                    market_state.phase1_detail = f"Sniper already fired | t={tr:.0f}s"
             return
 
         # ── Phase 2 Monitor (existing position) ──────────────────────────────
@@ -1018,21 +1023,18 @@ class StrategyExecutor:
             )
             return
 
-        # ── All gates passed — fire ──────────────────────────────────────────
-        # aggressive_price = SNIPER_LIMIT_PRICE (1.00) — avoids IOC cancel on ask micro-ticks
-        aggressive_limit = config.SNIPER_LIMIT_PRICE
+        # ── All gates passed — place GTC limit order ─────────────────────────
         target_shares = sniper_size / current_price
 
         log.info(
             "%s Phase 3 Sniper FIRED | market=%s | side=%s"
-            " | ask=%.4f | limit=%.4f | size=$%.2f (%.0f%% balance)"
+            " | ask=%.4f | size=$%.2f (%.0f%% balance)"
             " | shares=%.4f | expected_profit=$%.4f"
             " | OBI=%.3f | δ=%.4f | t=%.1fs",
             mode_tag,
             market_state.market_label,
             entry_side.value,
             current_price,
-            aggressive_limit,
             sniper_size,
             size_ratio * 100,
             target_shares,
@@ -1042,24 +1044,72 @@ class StrategyExecutor:
             snap.time_remaining,
         )
 
-        fill = await self._exec.execute_taker_buy(
+        order = await self._exec.place_limit_order(
             condition_id=snap.condition_id,
             market_label=market_state.market_label,
             asset=snap.asset,
             timeframe=snap.timeframe,
             token_id=sniper_token,
             side=entry_side,
+            price=current_price,
+            size_usdc=sniper_size,
             phase="PHASE3_SNIPER",
-            aggressive_price=aggressive_limit,
-            expected_fill_price=current_price,
-            target_shares=target_shares,
-            max_size_usdc=sniper_size,
         )
 
-        # Mark as fired regardless of fill — no retry in this window
         sstate.phase3_sniper_fired = True
 
-        if fill is not None:
+        if order is None:
+            market_state.phase2_status = Phase2Status.ABORTED
+            market_state.abort_reason = "Sniper: limit order rejected"
+            log.info(
+                "%s Phase 3 Sniper REJECTED | market=%s | side=%s | ask=%.4f | size=$%.2f | t=%.1fs",
+                mode_tag, market_state.market_label, entry_side.value,
+                current_price, sniper_size, snap.time_remaining,
+            )
+            return
+
+        sstate.phase3_order_id = order.order_id
+        log.info(
+            "%s Phase 3 Sniper LIMIT PLACED | market=%s | side=%s"
+            " | ask=%.4f | size=$%.2f | order=%s | t=%.1fs",
+            mode_tag, market_state.market_label, entry_side.value,
+            current_price, sniper_size, order.order_id[:12], snap.time_remaining,
+        )
+
+        # Poll for fill up to PHASE3_LIMIT_TIMEOUT seconds
+        best_ask_up = current_price if entry_side == Side.UP else 0.0
+        best_ask_down = current_price if entry_side == Side.DOWN else 0.0
+        deadline = time.time() + PHASE3_LIMIT_TIMEOUT
+        fill: Optional[Fill] = None
+
+        while time.time() < deadline:
+            fills = await self._exec.process_limit_crosses(
+                condition_id=snap.condition_id,
+                market_label=market_state.market_label,
+                asset=snap.asset,
+                timeframe=snap.timeframe,
+                best_ask_up=best_ask_up,
+                best_ask_down=best_ask_down,
+            )
+            if fills:
+                fill = fills[0]
+                break
+            open_orders = self._exec.get_open_orders(snap.condition_id)
+            if not any(o.order_id == order.order_id for o in open_orders):
+                break
+            await asyncio.sleep(PHASE3_LIMIT_POLL_INTERVAL)
+
+        if fill is None:
+            await self._exec.cancel_order(order.order_id)
+            sstate.phase3_order_id = ""
+            market_state.phase2_status = Phase2Status.ABORTED
+            market_state.abort_reason = "Sniper limit not filled — timed out"
+            log.info(
+                "%s Phase 3 Sniper TIMEOUT | market=%s | side=%s | ask=%.4f | size=$%.2f | t=%.1fs",
+                mode_tag, market_state.market_label, entry_side.value,
+                current_price, sniper_size, snap.time_remaining,
+            )
+        else:
             actual_profit = fill.shares - fill.size
             market_state.phase2_status = Phase2Status.EXECUTED
             market_state.abort_reason = ""
@@ -1068,6 +1118,7 @@ class StrategyExecutor:
             market_state.position_token_id = sniper_token
             market_state.phase2_bullets_fired = 1
             market_state.phase2_spend = fill.size
+            sstate.phase3_order_id = ""
 
             log.info(
                 "%s Phase 3 Sniper FILLED | market=%s | side=%s"
@@ -1080,19 +1131,6 @@ class StrategyExecutor:
                 fill.shares,
                 fill.size,
                 actual_profit,
-                snap.time_remaining,
-            )
-        else:
-            market_state.phase2_status = Phase2Status.ABORTED
-            market_state.abort_reason = "Sniper not filled — no retry"
-            log.info(
-                "%s Phase 3 Sniper NOT FILLED | market=%s | side=%s"
-                " | ask=%.4f | size=$%.2f | t=%.1fs",
-                mode_tag,
-                market_state.market_label,
-                entry_side.value,
-                current_price,
-                sniper_size,
                 snap.time_remaining,
             )
 
