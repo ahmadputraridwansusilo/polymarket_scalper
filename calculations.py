@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+EPSILON = 1e-9
+
 
 # ---------------------------------------------------------------------------
 # Phase 1 hedge plan
@@ -188,3 +190,197 @@ def compute_prob_edge(win_probability: float, token_ask_price: float) -> float:
     if not (0.0 < token_ask_price < 1.0):
         return 0.0
     return win_probability - token_ask_price
+
+
+# ---------------------------------------------------------------------------
+# Unified strategy helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HedgePlan:
+    hedge_amount: float
+    hedge_price: float
+    hedge_shares: float
+    total_cost: float
+    entry_payout: float
+    hedge_payout: float
+    entry_net: float
+    hedge_net: float
+    classification: str
+
+    @property
+    def worst_case_net(self) -> float:
+        return min(self.entry_net, self.hedge_net)
+
+    @property
+    def best_case_net(self) -> float:
+        return max(self.entry_net, self.hedge_net)
+
+
+def compute_scaled_entry_amount(
+    *,
+    base_entry_amount: float,
+    current_total_equity: float,
+    reference_total_equity: float,
+) -> float:
+    if base_entry_amount <= 0 or current_total_equity <= 0:
+        return 0.0
+    reference = max(reference_total_equity, EPSILON)
+    scaled = base_entry_amount * (current_total_equity / reference)
+    return math.floor((scaled * 100.0) + 1e-9) / 100.0
+
+
+def compute_mark_to_market_value(shares: float, price: float) -> float:
+    if shares <= 0 or price <= 0:
+        return 0.0
+    return shares * price
+
+
+def compute_profit_ratio(cost_basis: float, current_value: float) -> float:
+    if cost_basis <= 0:
+        return 0.0
+    return (current_value - cost_basis) / cost_basis
+
+
+def compute_loss_ratio(cost_basis: float, current_value: float) -> float:
+    if cost_basis <= 0:
+        return 0.0
+    return max(0.0, (cost_basis - current_value) / cost_basis)
+
+
+def compute_shares_to_sell(total_shares: float, sell_percent: float) -> float:
+    if total_shares <= 0 or sell_percent <= 0:
+        return 0.0
+    portion = min(100.0, max(0.0, sell_percent)) / 100.0
+    return total_shares * portion
+
+
+def evaluate_hedge_plan(
+    *,
+    entry_cost: float,
+    entry_shares: float,
+    hedge_price: float,
+    hedge_amount: float,
+    tolerance: float = 1e-6,
+) -> HedgePlan | None:
+    if entry_cost <= 0 or entry_shares <= 0:
+        return None
+    if hedge_amount <= 0 or not 0 < hedge_price < 1:
+        return None
+
+    hedge_shares = hedge_amount / hedge_price
+    total_cost = entry_cost + hedge_amount
+    entry_payout = entry_shares
+    hedge_payout = hedge_shares
+    entry_net = entry_payout - total_cost
+    hedge_net = hedge_payout - total_cost
+
+    if entry_net > tolerance and hedge_net > tolerance:
+        classification = "LOCK_BOTH_PROFIT"
+    elif entry_net >= -tolerance and hedge_net >= -tolerance:
+        if abs(entry_net) <= tolerance and abs(hedge_net) <= tolerance:
+            classification = "BREAK_EVEN_BOTH"
+        else:
+            classification = "LOCK_ONE_PROFIT_ONE_BREAKEVEN"
+    else:
+        classification = "NOT_WORTH_IT"
+
+    return HedgePlan(
+        hedge_amount=hedge_amount,
+        hedge_price=hedge_price,
+        hedge_shares=hedge_shares,
+        total_cost=total_cost,
+        entry_payout=entry_payout,
+        hedge_payout=hedge_payout,
+        entry_net=entry_net,
+        hedge_net=hedge_net,
+        classification=classification,
+    )
+
+
+def compute_sniper_net_profit_ratio(ask: float, slippage_estimate: float) -> float:
+    """Return worst-case net profit ratio for a taker sniper buy.
+
+    worst_fill = ask * (1 + slippage_estimate)
+    ratio      = 1.0 / worst_fill - 1.0
+
+    Returns 0.0 when inputs are degenerate (ask ≤ 0, ask ≥ 1, or worst_fill ≥ 1).
+    """
+    if ask <= 0 or ask >= 1.0 or slippage_estimate < 0:
+        return 0.0
+    worst_fill = ask * (1.0 + slippage_estimate)
+    if worst_fill >= 1.0:
+        return 0.0
+    return 1.0 / worst_fill - 1.0
+
+
+def find_minimum_hedge_plan(
+    *,
+    entry_cost: float,
+    entry_shares: float,
+    hedge_price: float,
+    max_hedge_amount: float,
+    minimum_hedge_amount: float = 0.01,
+    tolerance: float = 1e-6,
+) -> HedgePlan | None:
+    if entry_cost <= 0 or entry_shares <= 0:
+        return None
+    if not 0 < hedge_price < 1 or max_hedge_amount <= 0:
+        return None
+
+    max_entry_safe_amount = max(0.0, entry_shares - entry_cost)
+    capped_upper = min(max_hedge_amount, max_entry_safe_amount)
+    if capped_upper <= 0:
+        return None
+
+    lower_cents = max(1, int(math.ceil(max(0.0, minimum_hedge_amount) * 100.0 - 1e-9)))
+    upper_cents = int(math.floor(capped_upper * 100.0 + 1e-9))
+    if lower_cents > upper_cents:
+        return None
+
+    high_plan = evaluate_hedge_plan(
+        entry_cost=entry_cost,
+        entry_shares=entry_shares,
+        hedge_price=hedge_price,
+        hedge_amount=upper_cents / 100.0,
+        tolerance=tolerance,
+    )
+    if high_plan is None or high_plan.hedge_net < -tolerance:
+        return None
+
+    feasible_cents: int | None = None
+    lo = lower_cents
+    hi = upper_cents
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        mid_plan = evaluate_hedge_plan(
+            entry_cost=entry_cost,
+            entry_shares=entry_shares,
+            hedge_price=hedge_price,
+            hedge_amount=mid / 100.0,
+            tolerance=tolerance,
+        )
+        if mid_plan is None:
+            return None
+        if mid_plan.hedge_net >= -tolerance:
+            feasible_cents = mid
+            hi = mid - 1
+        else:
+            lo = mid + 1
+
+    if feasible_cents is None:
+        return None
+
+    plan = evaluate_hedge_plan(
+        entry_cost=entry_cost,
+        entry_shares=entry_shares,
+        hedge_price=hedge_price,
+        hedge_amount=feasible_cents / 100.0,
+        tolerance=tolerance,
+    )
+    if plan is None:
+        return None
+    if plan.entry_net < -tolerance or plan.classification == "NOT_WORTH_IT":
+        return None
+    return plan

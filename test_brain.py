@@ -1,12 +1,13 @@
 import time
 import unittest
 
-from brain import Brain, MarketState, Phase1Status
+import config
+from brain import Brain, MarketState
 from executioner import (
     BookLevel,
+    LiveOrderManager,
     OrderBookSnapshot,
     PortfolioSnapshot,
-    PositionSnapshot,
     Side,
     SimulatorOrderManager,
 )
@@ -16,14 +17,12 @@ from oracle import MarketSnapshot
 class _DummyExec:
     def __init__(
         self,
-        available_balance: float = 10.0,
+        available_balance: float = 49.0,
         total_equity: float | None = None,
         active_positions: dict | None = None,
     ) -> None:
         self._available_balance = available_balance
-        self._total_equity = (
-            available_balance if total_equity is None else total_equity
-        )
+        self._total_equity = available_balance if total_equity is None else total_equity
         self._active_positions = active_positions or {}
 
     async def get_portfolio_snapshot(self) -> PortfolioSnapshot:
@@ -42,7 +41,7 @@ class _DummyExec:
 class BrainHelperTests(unittest.TestCase):
     def _brain(
         self,
-        available_balance: float = 10.0,
+        available_balance: float = 49.0,
         total_equity: float | None = None,
     ) -> Brain:
         brain = Brain.__new__(Brain)
@@ -50,38 +49,40 @@ class BrainHelperTests(unittest.TestCase):
             available_balance=available_balance,
             total_equity=total_equity,
         )
-        brain._oracle = type("_OracleStub", (), {"price_momentum": staticmethod(lambda asset, lookback_seconds=30.0: 0.0)})()
+        brain._oracle = type("_OracleStub", (), {})()
         brain._phase2_tasks = {}
-        brain._session_start_balance = 45.0
+        brain._states = {}
+        brain._session_start_balance = config.INITIAL_BALANCE
+        brain._wins = 0
+        brain._losses = 0
         return brain
 
-    def test_phase1_child_order_matches_polymarket_taker_minimum(self) -> None:
-        self.assertAlmostEqual(Brain._phase1_child_order_usdc(0.19), 1.00)
-        self.assertAlmostEqual(Brain._phase1_child_order_usdc(0.31), 1.63)
-        self.assertAlmostEqual(Brain._phase1_child_order_usdc(0.80), 4.20)
+    def test_scaled_entry_amount_uses_initial_balance_as_reference(self) -> None:
+        brain = self._brain()
 
-    def test_phase1_anchor_cap_uses_five_percent_of_total_balance(self) -> None:
-        self.assertAlmostEqual(Brain._phase1_anchor_cap_usdc(45.0), 2.25)
-        self.assertAlmostEqual(Brain._phase1_anchor_cap_usdc(12.34), 0.61)
-
-    def test_phase1_target_side_uses_obi_thresholds(self) -> None:
-        self.assertEqual(Brain._phase1_target_side(0.71), Side.UP)
-        self.assertEqual(Brain._phase1_target_side(0.29), Side.DOWN)
-        self.assertIsNone(Brain._phase1_target_side(0.50))
-
-    def test_phase2_reason_bucket_normalizes_numeric_noise(self) -> None:
-        self.assertEqual(
-            Brain._phase2_reason_bucket("Danger zone | delta=0.14 < 0.35"),
-            "danger-zone",
-        )
-        self.assertEqual(
-            Brain._phase2_reason_bucket(
-                "twap_alloc=3.6900 below minimum 3x child_size=5.2000"
+        self.assertAlmostEqual(
+            brain._scaled_entry_amount(
+                total_equity=49.0,
+                available_balance=49.0,
+                ask_price=0.20,
             ),
-            "twap-cap-vs-min-order",
+            3.0,
+        )
+        self.assertAlmostEqual(
+            brain._scaled_entry_amount(
+                total_equity=98.0,
+                available_balance=98.0,
+                ask_price=0.20,
+            ),
+            6.0,
         )
 
-    def test_market_obi_falls_back_to_price_skew_when_simulated_books_are_symmetric(self) -> None:
+    def test_obi_side_uses_safe_margin_band(self) -> None:
+        self.assertEqual(Brain._obi_side(0.61), Side.UP)
+        self.assertEqual(Brain._obi_side(0.39), Side.DOWN)
+        self.assertIsNone(Brain._obi_side(0.50))
+
+    def test_market_obi_falls_back_to_price_skew_when_books_are_symmetric(self) -> None:
         up_book = OrderBookSnapshot(
             token_id="up",
             bids=[BookLevel(price=0.79, size=10000.0)],
@@ -126,70 +127,12 @@ class BrainHelperTests(unittest.TestCase):
             tick_size=0.01,
         )
 
-        self.assertGreater(Brain._derive_obi_value(snap, flat_up, flat_down), 0.70)
+        self.assertGreaterEqual(Brain._derive_obi_value(snap, flat_up, flat_down), 0.60)
 
-    def test_anti_spoof_thresholds_flip_against_position(self) -> None:
-        self.assertTrue(Brain._obi_heavily_against(Side.UP, 0.24))
-        self.assertFalse(Brain._obi_heavily_against(Side.UP, 0.26))
-        self.assertTrue(Brain._obi_heavily_against(Side.DOWN, 0.76))
-        self.assertFalse(Brain._obi_heavily_against(Side.DOWN, 0.74))
-
-    def test_hold_to_settlement_becomes_sticky(self) -> None:
+    def test_oracle_gate_requires_delta_beyond_margin(self) -> None:
         brain = self._brain()
-        state = MarketState(
-            condition_id="cid",
-            market_label="BTC 5m",
-            asset="BTC",
-            timeframe="5m",
-            position_side=Side.UP,
-            position_source="PHASE1",
-            position_cost=6.0,
-            position_shares=10.0,
-            avg_entry_price=0.60,
-        )
-        snap = MarketSnapshot(
-            condition_id="cid",
-            asset="BTC",
-            timeframe="5m",
-            up_token_id="up",
-            down_token_id="down",
-            strike_price=100000.0,
-            event_start_time=time.time() - 180.0,
-            end_time=time.time() + 119.0,
-            binance_live_price=100050.0,
-        )
-        high_bid_book = OrderBookSnapshot(
-            token_id="up",
-            bids=[BookLevel(price=0.86, size=50.0)],
-            asks=[BookLevel(price=0.87, size=50.0)],
-            tick_size=0.01,
-        )
+        margin = config.safe_margin_for("BTC") * config.SAFE_MARGIN_DELTA
 
-        self.assertTrue(brain._should_hold_to_settlement(snap, state, high_bid_book))
-        self.assertTrue(state.hold_to_settlement)
-
-        later_snap = MarketSnapshot(
-            condition_id="cid",
-            asset="BTC",
-            timeframe="5m",
-            up_token_id="up",
-            down_token_id="down",
-            strike_price=100000.0,
-            event_start_time=time.time() - 180.0,
-            end_time=time.time() + 15.0,
-            binance_live_price=100050.0,
-        )
-        lower_bid_book = OrderBookSnapshot(
-            token_id="up",
-            bids=[BookLevel(price=0.70, size=50.0)],
-            asks=[BookLevel(price=0.71, size=50.0)],
-            tick_size=0.01,
-        )
-
-        self.assertTrue(brain._should_hold_to_settlement(later_snap, state, lower_bid_book))
-
-    def test_oracle_gate_requires_delta_strictly_beyond_safe_margin(self) -> None:
-        brain = self._brain()
         at_margin = MarketSnapshot(
             condition_id="cid",
             asset="BTC",
@@ -199,7 +142,7 @@ class BrainHelperTests(unittest.TestCase):
             strike_price=68000.0,
             event_start_time=time.time() - 60.0,
             end_time=time.time() + 30.0,
-            binance_live_price=68015.0,
+            binance_live_price=68000.0 + margin,
         )
         beyond_margin = MarketSnapshot(
             condition_id="cid",
@@ -210,95 +153,92 @@ class BrainHelperTests(unittest.TestCase):
             strike_price=68000.0,
             event_start_time=time.time() - 60.0,
             end_time=time.time() + 30.0,
-            binance_live_price=68015.5,
+            binance_live_price=68000.0 + margin + 0.5,
         )
 
-        safe, delta_abs, margin = brain._oracle_gate(at_margin)
+        safe, delta_abs, returned_margin = brain._oracle_gate(at_margin)
         self.assertFalse(safe)
-        self.assertAlmostEqual(delta_abs, 15.0)
-        self.assertAlmostEqual(margin, 15.0)
+        self.assertAlmostEqual(delta_abs, margin)
+        self.assertAlmostEqual(returned_margin, margin)
 
-        safe, delta_abs, margin = brain._oracle_gate(beyond_margin)
+        safe, delta_abs, returned_margin = brain._oracle_gate(beyond_margin)
         self.assertTrue(safe)
-        self.assertAlmostEqual(delta_abs, 15.5)
-        self.assertAlmostEqual(margin, 15.0)
+        self.assertAlmostEqual(delta_abs, margin + 0.5)
+        self.assertAlmostEqual(returned_margin, margin)
 
-
-class BrainPhase2PlanTests(unittest.IsolatedAsyncioTestCase):
-    def _brain(
-        self,
-        available_balance: float = 10.0,
-        total_equity: float | None = None,
-        active_positions: dict | None = None,
-    ) -> Brain:
-        brain = Brain.__new__(Brain)
-        brain._exec = _DummyExec(
-            available_balance=available_balance,
-            total_equity=total_equity,
-            active_positions=active_positions,
-        )
-        brain._oracle = type("_OracleStub", (), {"price_momentum": staticmethod(lambda asset, lookback_seconds=30.0: 0.0)})()
-        brain._phase2_tasks = {}
-        brain._session_start_balance = 45.0
-        return brain
-
-    def _snap(self) -> MarketSnapshot:
-        return MarketSnapshot(
+    def test_build_hedge_plan_finds_locked_hedge_for_cheap_opposite_side(self) -> None:
+        brain = self._brain()
+        state = MarketState(
             condition_id="cid",
+            market_label="BTC 5m",
             asset="BTC",
             timeframe="5m",
+            position_side=Side.UP,
+            position_token_id="up",
+            position_cost=5.0,
+            position_shares=6.17,
+            avg_entry_price=0.81,
             up_token_id="up",
-            down_token_id="down",
-            strike_price=68000.0,
-            event_start_time=time.time() - 60.0,
-            end_time=time.time() + 12.0,
-            best_ask_up=0.94,
-            best_bid_up=0.93,
-            best_ask_down=0.08,
-            best_bid_down=0.07,
-            binance_live_price=68040.0,
+            up_cost=5.0,
+            up_shares=6.17,
+            up_avg_entry_price=0.81,
+        )
+        hedge_book = OrderBookSnapshot(
+            token_id="down",
+            bids=[BookLevel(price=0.06, size=100.0)],
+            asks=[BookLevel(price=0.07, size=100.0)],
+            tick_size=0.01,
+        )
+
+        plan = brain._build_hedge_plan(
+            state=state,
+            hedge_side=Side.DOWN,
+            hedge_book=hedge_book,
+            max_hedge_amount=10.0,
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertGreaterEqual(plan.entry_net, -1e-6)
+        self.assertGreaterEqual(plan.hedge_net, -1e-6)
+        self.assertAlmostEqual(plan.hedge_amount, 1.0)
+
+    def test_dual_take_profit_sells_both_when_both_sides_are_in_profit(self) -> None:
+        brain = self._brain()
+        state = MarketState(
+            condition_id="cid",
+            market_label="BTC 5m",
+            asset="BTC",
+            timeframe="5m",
+            up_cost=3.0,
+            up_shares=6.0,
+            down_cost=1.2,
+            down_shares=12.0,
+        )
+        up_book = OrderBookSnapshot(
+            token_id="up",
+            bids=[BookLevel(price=0.70, size=100.0)],
+            asks=[BookLevel(price=0.71, size=100.0)],
+            tick_size=0.01,
+        )
+        down_book = OrderBookSnapshot(
+            token_id="down",
+            bids=[BookLevel(price=0.15, size=100.0)],
+            asks=[BookLevel(price=0.16, size=100.0)],
+            tick_size=0.01,
+        )
+
+        self.assertEqual(
+            brain._dual_take_profit_candidates(
+                state=state,
+                up_book=up_book,
+                down_book=down_book,
+            ),
+            (Side.UP, Side.DOWN),
         )
 
 
 class BrainDashboardSnapshotTests(unittest.IsolatedAsyncioTestCase):
-    def _brain(
-        self,
-        available_balance: float = 10.0,
-        total_equity: float | None = None,
-        active_positions: dict | None = None,
-    ) -> Brain:
-        brain = Brain.__new__(Brain)
-        brain._exec = _DummyExec(
-            available_balance=available_balance,
-            total_equity=total_equity,
-            active_positions=active_positions,
-        )
-        brain._oracle = type(
-            "_OracleStub",
-            (),
-            {"price_momentum": staticmethod(lambda asset, lookback_seconds=30.0: 0.0)},
-        )()
-        brain._phase2_tasks = {}
-        brain._session_start_balance = 45.0
-        return brain
-
-    def _snap(self) -> MarketSnapshot:
-        return MarketSnapshot(
-            condition_id="cid",
-            asset="BTC",
-            timeframe="5m",
-            up_token_id="up",
-            down_token_id="down",
-            strike_price=68000.0,
-            event_start_time=time.time() - 60.0,
-            end_time=time.time() + 12.0,
-            best_ask_up=0.94,
-            best_bid_up=0.93,
-            best_ask_down=0.08,
-            best_bid_down=0.07,
-            binance_live_price=68040.0,
-        )
-
     async def test_dashboard_snapshot_keeps_recently_closed_market_visible(self) -> None:
         closed_snap = MarketSnapshot(
             condition_id="cid-close",
@@ -324,30 +264,26 @@ class BrainDashboardSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 "active_markets": staticmethod(lambda: []),
                 "all_markets": staticmethod(lambda: [closed_snap]),
                 "status_line": staticmethod(lambda: "Gamma OK | Binance OK | LIVE"),
-                "price_momentum": staticmethod(lambda asset, lookback_seconds=30.0: 0.0),
             },
         )()
 
         brain = Brain.__new__(Brain)
         brain._oracle = oracle
-        brain._exec = _DummyExec(available_balance=100.0, total_equity=100.0)
+        brain._exec = _DummyExec(available_balance=49.0, total_equity=49.0)
         brain._states = {
             "cid-close": MarketState(
                 condition_id="cid-close",
                 market_label="BTC 5m",
                 asset="BTC",
                 timeframe="5m",
-                position_side=Side.UP,
-                position_source="PHASE2",
-                position_cost=15.0,
-                position_shares=16.0,
-                avg_entry_price=0.9375,
+                up_shares=10.0,
+                up_cost=6.0,
             )
         }
         brain._phase2_tasks = {}
         brain._wins = 0
         brain._losses = 0
-        brain._session_start_balance = 100.0
+        brain._session_start_balance = 49.0
 
         snapshot = await brain.get_dashboard_snapshot()
 
@@ -355,230 +291,52 @@ class BrainDashboardSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.markets[0].phase, "Closing")
         self.assertEqual(snapshot.markets[0].detail, "Waiting settlement window")
 
-    async def test_phase2_plan_builds_asymmetric_twap_chunks(self) -> None:
-        brain = self._brain(available_balance=1000.0, total_equity=1000.0)
-        snap = self._snap()
-        winning_book = OrderBookSnapshot(
-            token_id="up",
-            bids=[BookLevel(price=0.93, size=100.0)],
-            asks=[BookLevel(price=0.94, size=100.0)],
-            tick_size=0.001,
-        )
-        losing_book = OrderBookSnapshot(
-            token_id="down",
-            bids=[BookLevel(price=0.07, size=100.0)],
-            asks=[BookLevel(price=0.08, size=100.0)],
-            tick_size=0.001,
-        )
-
-        decision = await brain._build_phase2_plan(
-            snap=snap,
-            winning_side=Side.UP,
-            winning_token="up",
-            losing_side=Side.DOWN,
-            losing_token="down",
-            winning_book=winning_book,
-            losing_book=losing_book,
-        )
-
-        self.assertIsNotNone(decision.plan)
-        plan = decision.plan
-        assert plan is not None
-        self.assertAlmostEqual(plan.total_exposure_usdc, 150.0)
-        self.assertAlmostEqual(plan.winning_allocation_usdc, 142.5)
-        self.assertAlmostEqual(plan.insurance_allocation_usdc, 7.5)
-        self.assertGreaterEqual(len(plan.chunk_sizes_usdc), 3)
-        self.assertLessEqual(len(plan.chunk_sizes_usdc), 5)
-        self.assertAlmostEqual(sum(plan.chunk_sizes_usdc), 142.5)
-        self.assertLess(plan.chunk_fill_prices[0], plan.chunk_fill_prices[-1])
-
-    async def test_phase2_plan_rejects_when_twap_cannot_support_three_chunks(self) -> None:
-        brain = self._brain(available_balance=30.0, total_equity=200.0)
-        snap = self._snap()
-        winning_book = OrderBookSnapshot(
-            token_id="down",
-            bids=[BookLevel(price=0.79, size=100.0)],
-            asks=[BookLevel(price=0.80, size=100.0)],
-            tick_size=0.01,
-        )
-        losing_book = OrderBookSnapshot(
-            token_id="up",
-            bids=[BookLevel(price=0.19, size=100.0)],
-            asks=[BookLevel(price=0.20, size=100.0)],
-            tick_size=0.01,
-        )
-
-        decision = await brain._build_phase2_plan(
-            snap=snap,
-            winning_side=Side.DOWN,
-            winning_token="down",
-            losing_side=Side.UP,
-            losing_token="up",
-            winning_book=winning_book,
-            losing_book=losing_book,
-        )
-
-        self.assertIsNone(decision.plan)
-        self.assertIn("twap_alloc=", decision.reason)
-        self.assertIn("child_size=", decision.reason)
-
-    async def test_perfect_hedge_plan_matches_expected_sniper_loss(self) -> None:
-        brain = self._brain(available_balance=1000.0, total_equity=1000.0)
-        snap = self._snap()
-        losing_book = OrderBookSnapshot(
-            token_id="down",
-            bids=[BookLevel(price=0.09, size=100.0)],
-            asks=[BookLevel(price=0.10, size=100.0)],
-            tick_size=0.01,
-        )
-
-        decision = await brain._build_perfect_hedge_plan(
-            snap=snap,
-            winning_side=Side.UP,
-            losing_side=Side.DOWN,
-            losing_token="down",
-            losing_book=losing_book,
-        )
-
-        self.assertIsNotNone(decision.plan)
-        plan = decision.plan
-        assert plan is not None
-        self.assertAlmostEqual(plan.target_shares, 150.0)
-        self.assertAlmostEqual(plan.spend_usdc, 15.0)
-
-    async def test_god_tier_hedge_plan_offsets_existing_risk_plus_projected_sniper(self) -> None:
-        active_positions = {
-            "cid": {
-                "UP": PositionSnapshot(
-                    condition_id="cid",
-                    market_label="BTC 5m",
-                    asset="BTC",
-                    timeframe="5m",
-                    token_id="up",
-                    side="UP",
-                    shares=100.0,
-                    cost_basis=100.0,
-                    avg_entry_price=1.0,
-                )
-            }
-        }
-        brain = self._brain(
-            available_balance=1000.0,
-            total_equity=1100.0,
-            active_positions=active_positions,
-        )
-        snap = self._snap()
-        losing_book = OrderBookSnapshot(
-            token_id="down",
-            bids=[BookLevel(price=0.02, size=100.0)],
-            asks=[BookLevel(price=0.03, size=100.0)],
-            tick_size=0.01,
-        )
-
-        decision = await brain._build_god_tier_hedge_plan(
-            snap=snap,
-            winning_side=Side.UP,
-            losing_side=Side.DOWN,
-            losing_token="down",
-            losing_book=losing_book,
-        )
-
-        self.assertIsNotNone(decision.plan)
-        plan = decision.plan
-        assert plan is not None
-        self.assertAlmostEqual(plan.target_shares, 250.0)
-        self.assertAlmostEqual(plan.spend_usdc, 7.5)
-
-    async def test_otm_hedge_micro_allocation_scales_inside_insurance_band(self) -> None:
-        self.assertAlmostEqual(Brain._otm_hedge_spend_usdc(1000.0, 0.15), 5.0)
-        self.assertAlmostEqual(Brain._otm_hedge_spend_usdc(1000.0, 0.08), 7.5)
-        self.assertAlmostEqual(Brain._otm_hedge_spend_usdc(1000.0, 0.01), 10.0)
-
-    async def test_phase1_no_longer_places_proactive_anchor_orders(self) -> None:
-        brain = self._brain(available_balance=1000.0, total_equity=1000.0)
-        snap = MarketSnapshot(
-            condition_id="cid",
-            asset="BTC",
-            timeframe="5m",
-            up_token_id="up",
-            down_token_id="down",
-            strike_price=68000.0,
-            event_start_time=time.time() - 60.0,
-            end_time=time.time() + 90.0,
-            best_ask_up=0.88,
-            best_bid_up=0.87,
-            best_ask_down=0.12,
-            best_bid_down=0.11,
-            binance_live_price=68040.0,
-        )
-        up_book = OrderBookSnapshot(
-            token_id="up",
-            bids=[BookLevel(price=0.87, size=100.0)],
-            asks=[BookLevel(price=0.88, size=100.0)],
-            tick_size=0.001,
-        )
-        down_book = OrderBookSnapshot(
-            token_id="down",
-            bids=[BookLevel(price=0.11, size=100.0)],
-            asks=[BookLevel(price=0.12, size=100.0)],
-            tick_size=0.001,
-        )
-        burst_calls: list[str] = []
-
-        async def fake_book(
-            _snap: MarketSnapshot,
-            side: Side,
-            _token_id: str,
-        ) -> OrderBookSnapshot:
-            return up_book if side == Side.UP else down_book
-
-        async def fake_burst(**_kwargs) -> bool:
-            burst_calls.append("burst")
-            return True
-
-        brain._book_for_side = fake_book
-        brain._maybe_fire_phase1_burst = fake_burst
-        state = MarketState(
-            condition_id="cid",
-            market_label="BTC 5m",
-            asset="BTC",
-            timeframe="5m",
-        )
-
-        await brain.execute_phase_1(snap, state)
-
-        self.assertEqual(burst_calls, [])
-        self.assertEqual(state.phase1_status, Phase1Status.IDLE)
-        self.assertIn("Waiting hedge/sniper stack", state.phase1_detail)
-
 
 class ExecutionerTakerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_simulator_limit_crosses_fill_phase2_insurance_orders(self) -> None:
-        manager = SimulatorOrderManager(initial_balance=20.0)
+    async def test_live_order_book_uses_short_ttl_cache(self) -> None:
+        manager = LiveOrderManager.__new__(LiveOrderManager)
+        manager._sdk_ready = True
+        manager._order_book_cache = {}
+        manager._tick_size_cache = {}
 
-        order = await manager.place_limit_order(
-            condition_id="cid",
-            market_label="BTC 5m",
-            asset="BTC",
-            timeframe="5m",
-            token_id="down",
-            side=Side.DOWN,
-            price=0.15,
-            size_usdc=3.0,
-            phase="PHASE2_INSURANCE",
-        )
-        self.assertIsNotNone(order)
+        class _Level:
+            def __init__(self, price: float, size: float) -> None:
+                self.price = price
+                self.size = size
 
-        fills = await manager.process_limit_crosses(
-            condition_id="cid",
-            market_label="BTC 5m",
-            asset="BTC",
-            timeframe="5m",
-            best_ask_up=0.94,
-            best_ask_down=0.12,
-        )
-        self.assertEqual(len(fills), 1)
-        self.assertAlmostEqual(fills[0].price, 0.12)
+        summary = type(
+            "_Summary",
+            (),
+            {
+                "bids": [_Level(0.49, 100.0)],
+                "asks": [_Level(0.51, 120.0)],
+                "tick_size": 0.01,
+                "last_trade_price": 0.50,
+            },
+        )()
+        calls: list[str] = []
+
+        class _Client:
+            def get_order_book(self, token_id: str):
+                calls.append(token_id)
+                return summary
+
+        manager._client = _Client()
+
+        async def fake_sdk_read_call(fn):
+            return fn()
+
+        manager._sdk_read_call = fake_sdk_read_call
+
+        first = await manager.get_order_book("token-1")
+        second = await manager.get_order_book("token-1")
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(first.best_ask, 0.51)
+        self.assertAlmostEqual(second.best_bid, 0.49)
 
     async def test_simulator_taker_buy_rejects_below_dynamic_taker_minimum(self) -> None:
         manager = SimulatorOrderManager(initial_balance=20.0)
@@ -590,7 +348,7 @@ class ExecutionerTakerTests(unittest.IsolatedAsyncioTestCase):
             timeframe="5m",
             token_id="up",
             side=Side.UP,
-            phase="PHASE1_SPAM",
+            phase="ENTRY",
             aggressive_price=0.80,
             expected_fill_price=0.80,
             target_shares=5.0,
@@ -605,50 +363,13 @@ class ExecutionerTakerTests(unittest.IsolatedAsyncioTestCase):
             timeframe="5m",
             token_id="up",
             side=Side.UP,
-            phase="PHASE1_SPAM",
+            phase="ENTRY",
             aggressive_price=0.80,
             expected_fill_price=0.80,
             target_shares=5.25,
             max_size_usdc=4.20,
         )
         self.assertIsNotNone(filled)
-
-    async def test_simulator_taker_sell_realizes_profit_and_clears_position(self) -> None:
-        manager = SimulatorOrderManager(initial_balance=20.0)
-
-        buy_fill = await manager.execute_taker_buy(
-            condition_id="cid",
-            market_label="BTC 5m",
-            asset="BTC",
-            timeframe="5m",
-            token_id="up",
-            side=Side.UP,
-            phase="PHASE1_SPAM",
-            aggressive_price=0.50,
-            expected_fill_price=0.50,
-            target_shares=10.0,
-            max_size_usdc=5.0,
-        )
-        self.assertIsNotNone(buy_fill)
-
-        sell_fill = await manager.execute_taker_sell(
-            condition_id="cid",
-            market_label="BTC 5m",
-            asset="BTC",
-            timeframe="5m",
-            token_id="up",
-            side=Side.UP,
-            phase="PHASE1_TP",
-            target_shares=10.0,
-            expected_fill_price=0.60,
-        )
-        self.assertIsNotNone(sell_fill)
-
-        snapshot = await manager.get_portfolio_snapshot()
-        self.assertAlmostEqual(snapshot.realized_pnl, 1.0)
-        self.assertAlmostEqual(snapshot.available_balance, 21.0)
-        self.assertAlmostEqual(snapshot.locked_margin, 0.0)
-        self.assertEqual(snapshot.active_positions, {})
 
     async def test_simulator_settlement_redeems_penny_hedge_at_one_dollar(self) -> None:
         manager = SimulatorOrderManager(initial_balance=400.0)
@@ -660,7 +381,7 @@ class ExecutionerTakerTests(unittest.IsolatedAsyncioTestCase):
             timeframe="5m",
             token_id="up",
             side=Side.UP,
-            phase="PHASE2_SNIPER",
+            phase="ENTRY",
             aggressive_price=1.0,
             expected_fill_price=1.0,
             target_shares=300.0,
@@ -675,9 +396,9 @@ class ExecutionerTakerTests(unittest.IsolatedAsyncioTestCase):
             timeframe="5m",
             token_id="down",
             side=Side.DOWN,
+            phase="GOD_HEDGE",
             price=0.03,
             size_usdc=3.0,
-            phase="GOD_HEDGE",
         )
         self.assertIsNotNone(hedge_order)
 

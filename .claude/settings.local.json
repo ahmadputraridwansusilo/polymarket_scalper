@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk ls *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk wc *)",
+      "Bash(rtk git *)",
+      "Bash(python3 test_strategy_trace.py)",
+      "Bash(python3 -m pytest test_calculations.py test_brain.py test_oracle.py test_dashboard.py test_phase2_overlap.py -v)",
+      "Bash(python3 -m pytest test_brain.py test_phase2_overlap.py -x --tb=short)",
+      "Bash(python3 -m pytest test_strategy_trace.py -v)",
+      "Bash(python3 *)",
+      "Bash(rtk read *)",
+      "Bash(python *)"
+    ]
+  }
+}

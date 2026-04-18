@@ -89,8 +89,14 @@ async def main() -> None:
     if not config.DRY_RUN:
         await brain._exec.sync_live_balance()
         portfolio = await brain._exec.get_portfolio_snapshot()
-        brain._session_start_balance = portfolio.total_equity
-        log.info("[LIVE] Session start balance: $%.2f", brain._session_start_balance)
+        brain._session_start_balance = Brain._effective_total_equity(
+            portfolio.total_equity
+        )
+        log.info(
+            "[LIVE] Session start balance: wallet=$%.2f | strategy_bankroll=$%.2f",
+            portfolio.total_equity,
+            brain._session_start_balance,
+        )
 
     log.info("Starting Polymarket Scalper (DRY_RUN=%s).", config.DRY_RUN)
 

@@ -16,8 +16,22 @@ class DashboardRenderModeTests(unittest.TestCase):
                 term_name="dumb",
                 text_dashboard=False,
                 requested_mode="auto",
+                stdout_is_tty=True,
+                stderr_is_tty=True,
             ),
             "static",
+        )
+
+    def test_auto_mode_falls_back_to_text_when_stdout_is_not_tty(self) -> None:
+        self.assertEqual(
+            _resolve_dashboard_render_mode(
+                term_name="xterm-256color",
+                text_dashboard=False,
+                requested_mode="auto",
+                stdout_is_tty=False,
+                stderr_is_tty=False,
+            ),
+            "text",
         )
 
     def test_live_override_is_respected(self) -> None:
@@ -26,6 +40,8 @@ class DashboardRenderModeTests(unittest.TestCase):
                 term_name="dumb",
                 text_dashboard=False,
                 requested_mode="live",
+                stdout_is_tty=False,
+                stderr_is_tty=False,
             ),
             "live",
         )
@@ -36,6 +52,8 @@ class DashboardRenderModeTests(unittest.TestCase):
                 term_name="xterm-256color",
                 text_dashboard=True,
                 requested_mode="auto",
+                stdout_is_tty=True,
+                stderr_is_tty=True,
             ),
             "text",
         )

@@ -1,12 +1,23 @@
 """
 executioner.py — order execution and portfolio state.
 
-This module owns:
-  • portfolio accounting
-  • open-order reserves
-  • filled share positions
-  • realized PnL
-  • recent executions shown in the dashboard
+PATCHES APPLIED (v2):
+  1. [KRITIS] _resolve_live_taker_fill timeout: 1.0s → 3.5s
+     Mencegah false-negative fill detection yang menyebabkan satu sisi
+     ter-cancel padahal order sudah tereksekusi di exchange.
+
+  2. [KRITIS] Pisah SDK lock: _sdk_call_lock → _sdk_read_lock (Semaphore(3))
+     + _sdk_write_lock (Lock). Mencegah bottleneck dimana polling fill
+     memblokir semua order baru selama window kritis.
+
+  3. [KRITIS] Insurance placement dipindah ke dalam _run_phase2_twap,
+     setelah chunk pertama confirmed. Mencegah insurance ter-arm saat
+     TWAP gagal, yang menyebabkan posisi terbuka satu arah yang rugi.
+     Brain.py perlu disesuaikan: flag phase2_insurance_placed sekarang
+     di-set dari dalam _run_phase2_twap via helper baru.
+
+  4. [MINOR] Straddle: state.straddle_placed hanya True jika kedua leg
+     berhasil. Jika salah satu gagal, posisi yang ada di-cancel.
 """
 
 from __future__ import annotations
@@ -14,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import random
 import time
 import uuid
 from collections import deque
@@ -321,6 +333,16 @@ class OrderManagerBase:
     async def get_portfolio_snapshot(self) -> PortfolioSnapshot:
         raise NotImplementedError
 
+    async def clear_expired_market(
+        self,
+        condition_id: str,
+        market_label: str,
+        asset: str,
+        timeframe: str,
+        winning_side: Optional[Side],
+    ) -> SettlementResult:
+        raise NotImplementedError
+
     async def sync_live_balance(self) -> None:
         pass
 
@@ -362,6 +384,29 @@ class _PortfolioMixin:
     async def get_portfolio_snapshot(self) -> PortfolioSnapshot:
         async with self._lock:
             return self._snapshot_locked()
+
+    async def clear_expired_market(
+        self,
+        condition_id: str,
+        market_label: str,
+        asset: str,
+        timeframe: str,
+        winning_side: Optional[Side],
+    ) -> SettlementResult:
+        """Force-clear in-memory positions and locked margin for an expired market.
+
+        Called when on-chain settlement keeps failing so the dashboard no longer
+        shows stale positions or inflated locked exposure.  The actual wallet
+        balance is reconciled on the next sync_live_balance() call.
+        """
+        async with self._lock:
+            return self._settle_locked(
+                condition_id=condition_id,
+                market_label=market_label,
+                asset=asset,
+                timeframe=timeframe,
+                winning_side=winning_side,
+            )
 
     def _snapshot_locked(self) -> PortfolioSnapshot:
         positions: Dict[str, Dict[str, PositionSnapshot]] = {}
@@ -746,6 +791,11 @@ class _PortfolioMixin:
 class SimulatorOrderManager(_PortfolioMixin, OrderManagerBase):
     def __init__(self, initial_balance: float = config.INITIAL_BALANCE) -> None:
         super().__init__(initial_balance=initial_balance)
+        # Real CLOB book fetching — makes simulation constraints identical to live.
+        # Books are cached per token_id with a 1-second TTL to avoid API spam.
+        self._clob_session: Optional[object] = None  # aiohttp.ClientSession, lazy-init
+        self._clob_read_lock = asyncio.Semaphore(3)   # max 3 concurrent reads (same as live)
+        self._book_cache: Dict[str, tuple[Optional[OrderBookSnapshot], float]] = {}
 
     async def place_limit_order(
         self,
@@ -832,6 +882,79 @@ class SimulatorOrderManager(_PortfolioMixin, OrderManagerBase):
             self._track_order_placement_locked(down_order)
             return [replace(up_order), replace(down_order)]
 
+    # ------------------------------------------------------------------
+    # Real CLOB book fetching (public endpoint — no auth needed)
+    # Gives simulation the same depth constraints as live mode.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    async def _get_clob_session(self):
+        try:
+            import aiohttp
+            if self._clob_session is None or self._clob_session.closed:
+                timeout = aiohttp.ClientTimeout(connect=3.0, total=5.0)
+                self._clob_session = aiohttp.ClientSession(timeout=timeout)
+            return self._clob_session
+        except ImportError:
+            return None
+
+    async def _fetch_clob_book(self, token_id: str) -> tuple[Optional[OrderBookSnapshot], bool]:
+        """Fetch real depth from CLOB public API.
+
+        Returns `(book, hard_missing)`. `hard_missing=True` means the CLOB
+        explicitly reported that the token has no live orderbook, so SIM should
+        not fabricate a synthetic book for that market.
+        """
+        session = await self._get_clob_session()
+        if session is None:
+            return None, False
+        try:
+            async with self._clob_read_lock:
+                async with session.get(
+                    f"{config.CLOB_HOST}/book",
+                    params={"token_id": token_id},
+                ) as resp:
+                    if resp.status == 404:
+                        log.debug("[SIM] No live orderbook for %s", token_id[:16])
+                        return None, True
+                    if resp.status != 200:
+                        return None, False
+                    data = await resp.json(content_type=None)
+        except Exception as exc:
+            log.debug("[SIM] CLOB book fetch failed %s: %s", token_id[:16], exc)
+            return None, False
+
+        raw_bids = data.get("bids") or []
+        raw_asks = data.get("asks") or []
+        bids = [
+            BookLevel(price=float(b["price"]), size=float(b["size"]))
+            for b in raw_bids
+            if "price" in b and "size" in b
+        ]
+        asks = [
+            BookLevel(price=float(a["price"]), size=float(a["size"]))
+            for a in raw_asks
+            if "price" in a and "size" in a
+        ]
+        if not bids and not asks:
+            return None, True
+
+        tick = self._safe_float(data.get("tick_size", 0.01), default=0.01)
+        last_trade = self._safe_float(data.get("last_trade_price", 0.0), default=0.0)
+        return OrderBookSnapshot(
+            token_id=token_id,
+            bids=bids,
+            asks=asks,
+            tick_size=tick,
+            last_trade_price=last_trade,
+        ), False
+
     async def get_order_book(
         self,
         token_id: str,
@@ -842,15 +965,37 @@ class SimulatorOrderManager(_PortfolioMixin, OrderManagerBase):
         if not token_id or fallback_best_ask <= 0:
             return None
 
+        # Try real CLOB book first (1-second TTL cache to avoid API spam).
+        now = time.time()
+        cached = self._book_cache.get(token_id)
+        if cached and now - cached[1] < 1.0:
+            return cached[0]
+
+        real_book, hard_missing = await self._fetch_clob_book(token_id)
+        if real_book is not None:
+            self._book_cache[token_id] = (real_book, now)
+            return real_book
+        if hard_missing or not config.SIM_FALLBACK_SYNTHETIC_ON_NETWORK_ERROR:
+            self._book_cache[token_id] = (None, now)
+            return None
+
+        # Fallback — synthetic book when CLOB is unreachable.
         bid_size = max(config.SIMULATED_TOP_BOOK_SIZE, config.MIN_ORDER_SHARES * 10.0)
         ask_size = max(config.SIMULATED_TOP_BOOK_SIZE, config.MIN_ORDER_SHARES * 10.0)
-        return OrderBookSnapshot(
+        effective_bid = (
+            fallback_best_bid
+            if fallback_best_bid > 0
+            else fallback_best_ask * 0.97
+        )
+        book = OrderBookSnapshot(
             token_id=token_id,
-            bids=[BookLevel(price=max(0.0, fallback_best_bid), size=bid_size)],
+            bids=[BookLevel(price=max(0.0, effective_bid), size=bid_size)],
             asks=[BookLevel(price=fallback_best_ask, size=ask_size)],
             tick_size=config.SIMULATED_TICK_SIZE,
-            last_trade_price=fallback_best_bid or fallback_best_ask,
+            last_trade_price=effective_bid,
         )
+        self._book_cache[token_id] = (book, now)
+        return book
 
     async def execute_taker_buy(
         self,
@@ -869,7 +1014,10 @@ class SimulatorOrderManager(_PortfolioMixin, OrderManagerBase):
         if not token_id or target_shares < config.MIN_ORDER_SHARES:
             return None
 
-        actual_fill_price = expected_fill_price if expected_fill_price > 0 else aggressive_price
+        base_price = expected_fill_price if expected_fill_price > 0 else aggressive_price
+        # Realistic buy slippage: 0.1% – 0.3% above expected price, capped at aggressive.
+        slippage = random.uniform(1.001, 1.003)
+        actual_fill_price = min(base_price * slippage, aggressive_price if aggressive_price > 0 else base_price * slippage)
         min_size_usdc = config.minimum_taker_order_usdc(actual_fill_price)
         if max_size_usdc + 1e-9 < min_size_usdc:
             return None
@@ -895,13 +1043,21 @@ class SimulatorOrderManager(_PortfolioMixin, OrderManagerBase):
                 order_id=f"sim-taker-{uuid.uuid4().hex[:12]}",
             )
             self._track_order_placement_locked(order)
-            return self._apply_custom_fill_locked(
+            fill = self._apply_custom_fill_locked(
                 order,
                 fill_price=actual_fill_price,
                 fill_size_usdc=actual_cost,
                 shares=target_shares,
                 action="Taker Fill",
             )
+
+        if fill is not None:
+            log.info(
+                "[EXEC][SIM] action=BUY | market=%s | side=%s | phase=%s"
+                " | shares=%.4f | price=%.4f | cost=$%.2f",
+                market_label, side.value, phase, fill.shares, fill.price, fill.size,
+            )
+        return fill
 
     async def execute_taker_sell(
         self,
@@ -918,8 +1074,12 @@ class SimulatorOrderManager(_PortfolioMixin, OrderManagerBase):
         if not token_id or target_shares <= 0 or expected_fill_price <= 0:
             return None
 
+        # Realistic sell slippage: 0.1% – 0.3% below expected bid price.
+        slippage = random.uniform(0.997, 0.999)
+        actual_fill_price = expected_fill_price * slippage
+
         async with self._lock:
-            return self._apply_sell_fill_locked(
+            fill = self._apply_sell_fill_locked(
                 condition_id=condition_id,
                 market_label=market_label,
                 asset=asset,
@@ -927,10 +1087,18 @@ class SimulatorOrderManager(_PortfolioMixin, OrderManagerBase):
                 token_id=token_id,
                 side=side,
                 phase=phase,
-                fill_price=expected_fill_price,
+                fill_price=actual_fill_price,
                 shares=target_shares,
                 action="Taker Sell",
             )
+
+        if fill is not None:
+            log.info(
+                "[EXEC][SIM] action=SELL | market=%s | side=%s | phase=%s"
+                " | shares=%.4f | price=%.4f | cost=$%.2f",
+                market_label, side.value, phase, fill.shares, fill.price, fill.size,
+            )
+        return fill
 
     async def execute_sniper(
         self,
@@ -1020,7 +1188,16 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
     def __init__(self) -> None:
         super().__init__(initial_balance=config.INITIAL_BALANCE)
         self._tick_size_cache: Dict[str, float] = {}
-        self._sdk_call_lock = asyncio.Lock()
+        self._order_book_cache: Dict[str, tuple[Optional[OrderBookSnapshot], float, str]] = {}
+
+        # ----------------------------------------------------------------
+        # FIX #2: Pisah SDK lock → read (Semaphore) + write (Lock)
+        # Read calls (get_order, get_order_book) bisa concurrent max 3.
+        # Write calls (post_order, create_and_post_order) tetap serial.
+        # ----------------------------------------------------------------
+        self._sdk_read_lock = asyncio.Semaphore(3)
+        self._sdk_write_lock = asyncio.Lock()
+
         self._sdk_transport_mode = "unpatched"
         try:
             from py_clob_client.client import ClobClient
@@ -1121,8 +1298,17 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             self._sdk_transport_mode = f"patch-failed:{exc}"
             log.warning("[LIVE] Failed to patch py_clob_client transport: %s", exc)
 
-    async def _sdk_call(self, fn):
-        async with self._sdk_call_lock:
+    # ----------------------------------------------------------------
+    # FIX #2: Dua SDK call helper — read (concurrent) vs write (serial)
+    # ----------------------------------------------------------------
+    async def _sdk_read_call(self, fn):
+        """Concurrent-safe read — max 3 simultaneous (get_order, get_order_book, dll)."""
+        async with self._sdk_read_lock:
+            return await asyncio.get_running_loop().run_in_executor(None, fn)
+
+    async def _sdk_write_call(self, fn):
+        """Strictly serial write — satu per satu (post_order, create_and_post_order)."""
+        async with self._sdk_write_lock:
             return await asyncio.get_running_loop().run_in_executor(None, fn)
 
     @staticmethod
@@ -1159,7 +1345,7 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
 
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            resp = await self._sdk_call(lambda: self._client.get_balance_allowance(params))
+            resp = await self._sdk_read_call(lambda: self._client.get_balance_allowance(params))
             raw = resp.get("balance") or resp.get("usdc") or resp.get("USDC")
             if raw is None:
                 return None
@@ -1343,7 +1529,7 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             return cached
 
         try:
-            resp = await self._sdk_call(lambda: self._client.get_tick_size(token_id))
+            resp = await self._sdk_read_call(lambda: self._client.get_tick_size(token_id))
             tick = float(resp) if resp else 0.01
             tick = tick if tick > 0 else 0.01
             self._tick_size_cache[token_id] = tick
@@ -1391,6 +1577,55 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             return 0.0
         return math.floor((shares * 10_000.0) + 1e-9) / 10_000.0
 
+    @staticmethod
+    def _order_book_cache_ttl(cache_state: str) -> float:
+        if cache_state == "missing":
+            return config.LIVE_ORDERBOOK_MISSING_CACHE_TTL_SECONDS
+        if cache_state == "error":
+            return config.LIVE_ORDERBOOK_ERROR_CACHE_TTL_SECONDS
+        return config.LIVE_ORDERBOOK_CACHE_TTL_SECONDS
+
+    def _cache_order_book(
+        self,
+        token_id: str,
+        book: Optional[OrderBookSnapshot],
+        *,
+        cache_state: str,
+        cached_at: float,
+    ) -> None:
+        self._order_book_cache[token_id] = (book, cached_at, cache_state)
+
+    def _cached_order_book(
+        self,
+        token_id: str,
+        *,
+        now: float,
+    ) -> tuple[bool, Optional[OrderBookSnapshot]]:
+        cached = self._order_book_cache.get(token_id)
+        if cached is None:
+            return False, None
+        book, cached_at, cache_state = cached
+        ttl = self._order_book_cache_ttl(cache_state)
+        if now - cached_at <= ttl:
+            return True, book
+        return False, book
+
+    def _stale_live_order_book(
+        self,
+        token_id: str,
+        *,
+        now: float,
+    ) -> Optional[OrderBookSnapshot]:
+        cached = self._order_book_cache.get(token_id)
+        if cached is None:
+            return None
+        book, cached_at, cache_state = cached
+        if book is None or cache_state != "ok":
+            return None
+        if now - cached_at <= config.LIVE_ORDERBOOK_STALE_GRACE_SECONDS:
+            return book
+        return None
+
     def _validate_buy_feasibility(self, spend: float, price_hint: float) -> Optional[str]:
         if price_hint <= 0:
             return "price hint is not available"
@@ -1425,7 +1660,9 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
         price_value = round(price_hint if price_hint > 0 else fallback_price, 4)
         if spend <= 0:
             raise RuntimeError("rounded buy amount is zero after CLOB precision clamp")
-        signed_order = await self._sdk_call(
+
+        # Gunakan _sdk_write_call — order submission harus serial
+        signed_order = await self._sdk_write_call(
             lambda: self._client.create_market_order(
                 self._MarketOrderArgs(
                     token_id=token_id,
@@ -1437,7 +1674,7 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
                 )
             )
         )
-        response = await self._sdk_call(
+        response = await self._sdk_write_call(
             lambda: self._client.post_order(signed_order, self._taker_order_type)
         )
         order_id = ""
@@ -1458,7 +1695,9 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
         price_value = round(price_hint if price_hint > 0 else fallback_price, 4)
         if sell_shares <= 0:
             raise RuntimeError("rounded sell size is zero after CLOB precision clamp")
-        signed_order = await self._sdk_call(
+
+        # Gunakan _sdk_write_call — order submission harus serial
+        signed_order = await self._sdk_write_call(
             lambda: self._client.create_market_order(
                 self._MarketOrderArgs(
                     token_id=token_id,
@@ -1470,7 +1709,7 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
                 )
             )
         )
-        response = await self._sdk_call(
+        response = await self._sdk_write_call(
             lambda: self._client.post_order(signed_order, self._taker_order_type)
         )
         order_id = ""
@@ -1567,7 +1806,8 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
         self._ensure_builder_funder()
 
         try:
-            response = await self._sdk_call(
+            # Limit order placement — write call
+            response = await self._sdk_write_call(
                 lambda: self._client.create_and_post_order(
                     self._OrderArgs(
                         token_id=token_id,
@@ -1677,9 +1917,45 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
         if not self._sdk_ready or not token_id:
             return None
 
+        now = time.time()
+        cache_hit, cached_book = self._cached_order_book(token_id, now=now)
+        if cache_hit:
+            return cached_book
+
         try:
-            summary = await self._sdk_call(lambda: self._client.get_order_book(token_id))
+            # Read call — bisa concurrent
+            summary = await self._sdk_read_call(lambda: self._client.get_order_book(token_id))
         except Exception as exc:
+            exc_str = repr(exc).lower()
+            if (
+                "404" in exc_str
+                or "no orderbook exists" in exc_str
+                or "does not exist" in exc_str
+            ):
+                self._cache_order_book(
+                    token_id,
+                    None,
+                    cache_state="missing",
+                    cached_at=now,
+                )
+                log.debug("Order book missing for %s: %s", token_id[:16], exc)
+                return None
+
+            stale_book = self._stale_live_order_book(token_id, now=now)
+            if stale_book is not None:
+                log.debug(
+                    "Order book fetch failed for %s: %s — reusing cached book",
+                    token_id[:16],
+                    exc,
+                )
+                return stale_book
+
+            self._cache_order_book(
+                token_id,
+                None,
+                cache_state="error",
+                cached_at=now,
+            )
             log.debug("Order book fetch failed for %s: %s", token_id[:16], exc)
             return None
 
@@ -1697,16 +1973,29 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             default=fallback_best_bid or fallback_best_ask,
         )
         if not asks and not bids:
+            self._cache_order_book(
+                token_id,
+                None,
+                cache_state="missing",
+                cached_at=now,
+            )
             return None
 
         self._tick_size_cache[token_id] = tick_size
-        return OrderBookSnapshot(
+        book = OrderBookSnapshot(
             token_id=token_id,
             bids=bids,
             asks=asks,
             tick_size=tick_size,
             last_trade_price=last_trade,
         )
+        self._cache_order_book(
+            token_id,
+            book,
+            cache_state="ok",
+            cached_at=now,
+        )
+        return book
 
     async def execute_taker_buy(
         self,
@@ -1820,13 +2109,21 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             live_order = self._orders.get(posted_order_id or order.order_id)
             if not live_order:
                 return None
-            return self._apply_custom_fill_locked(
+            result = self._apply_custom_fill_locked(
                 live_order,
                 fill_price=fill["price"],
                 fill_size_usdc=fill["cost"],
                 shares=fill["shares"],
                 action="Taker Fill",
             )
+
+        if result is not None:
+            log.info(
+                "[EXEC][LIVE] action=BUY | market=%s | side=%s | phase=%s"
+                " | shares=%.4f | price=%.4f | cost=$%.2f",
+                market_label, side.value, phase, result.shares, result.price, result.size,
+            )
+        return result
 
     async def execute_taker_sell(
         self,
@@ -1883,7 +2180,7 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             return None
 
         async with self._lock:
-            return self._apply_sell_fill_locked(
+            result = self._apply_sell_fill_locked(
                 condition_id=condition_id,
                 market_label=market_label,
                 asset=asset,
@@ -1897,25 +2194,42 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
                 order_id=posted_order_id or None,
             )
 
+        if result is not None:
+            log.info(
+                "[EXEC][LIVE] action=SELL | market=%s | side=%s | phase=%s"
+                " | shares=%.4f | price=%.4f | cost=$%.2f",
+                market_label, side.value, phase, result.shares, result.price, result.size,
+            )
+        return result
+
     async def _resolve_live_taker_fill(
         self,
         *,
         order_id: str,
         fallback_fill_price: float,
         fallback_shares: float,
-        timeout: float = 1.0,
+        # ----------------------------------------------------------------
+        # FIX #1: Naikkan timeout dari 1.0s → 3.5s
+        # Polymarket CLOB butuh waktu lebih untuk mengkonfirmasi fill,
+        # terutama saat network congestion. 1s terlalu agresif dan
+        # menyebabkan false-negative → bot cancel order yang sebenarnya filled.
+        # ----------------------------------------------------------------
+        timeout: float = 3.5,
     ) -> Optional[dict]:
         if not order_id:
             return None
 
         deadline = time.time() + timeout
         last_payload: dict | None = None
+        poll_interval = 0.15  # sedikit lebih lambat dari 0.1 untuk kurangi SDK load
+
         while time.time() < deadline:
             try:
-                payload = await self._sdk_call(lambda: self._client.get_order(order_id))
+                # Read call — bisa concurrent dengan operasi lain
+                payload = await self._sdk_read_call(lambda: self._client.get_order(order_id))
             except Exception as exc:
                 log.debug("Order fill lookup failed for %s: %s", order_id[:12], exc)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(poll_interval)
                 continue
 
             if not isinstance(payload, dict):
@@ -1924,7 +2238,7 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
                     order_id[:12],
                     payload,
                 )
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(poll_interval)
                 continue
 
             last_payload = payload
@@ -1933,6 +2247,12 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
                 fill_price = self._safe_float(payload.get("price"), default=fallback_fill_price)
                 if fill_price <= 0:
                     fill_price = fallback_fill_price
+                log.debug(
+                    "[LIVE] Fill confirmed | order=%s | shares=%.4f | price=%.4f",
+                    order_id[:12],
+                    matched_shares,
+                    fill_price,
+                )
                 return {
                     "shares": matched_shares,
                     "price": fill_price,
@@ -1941,21 +2261,38 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
 
             status = str(payload.get("status", "")).upper()
             if status in {"CANCELED", "CANCELLED", "REJECTED"}:
+                log.warning(
+                    "[LIVE] Order %s returned status=%s before fill detected.",
+                    order_id[:12],
+                    status,
+                )
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(poll_interval)
 
+        # Satu pengecekan terakhir setelah timeout
         if isinstance(last_payload, dict):
             matched_shares = self._safe_float(last_payload.get("size_matched"), default=0.0)
             if matched_shares > 0:
                 fill_price = self._safe_float(last_payload.get("price"), default=fallback_fill_price)
                 if fill_price <= 0:
                     fill_price = fallback_fill_price
+                log.warning(
+                    "[LIVE] Fill recovered at deadline | order=%s | shares=%.4f",
+                    order_id[:12],
+                    matched_shares,
+                )
                 return {
                     "shares": matched_shares,
                     "price": fill_price,
                     "cost": matched_shares * fill_price,
                 }
 
+        log.warning(
+            "[LIVE] Fill not confirmed after %.1fs | order=%s | last_status=%s",
+            timeout,
+            order_id[:12],
+            str(last_payload.get("status", "unknown")).upper() if last_payload else "no-response",
+        )
         return None
 
     async def execute_sniper(
@@ -1991,7 +2328,7 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
             return False
 
         try:
-            await self._sdk_call(lambda: self._client.cancel(order_id))
+            await self._sdk_write_call(lambda: self._client.cancel(order_id))
         except Exception as exc:
             log.error("Cancel failed %s: %s", order_id, exc)
             return False
@@ -2029,7 +2366,8 @@ class LiveOrderManager(_PortfolioMixin, OrderManagerBase):
 
         for order in open_orders:
             try:
-                payload = await self._sdk_call(lambda oid=order.order_id: self._client.get_order(oid))
+                # Read call — concurrent OK
+                payload = await self._sdk_read_call(lambda oid=order.order_id: self._client.get_order(oid))
             except Exception as exc:
                 log.debug("Live limit fill lookup failed for %s: %s", order.order_id[:12], exc)
                 continue

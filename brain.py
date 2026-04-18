@@ -31,9 +31,10 @@ import time
 from typing import Dict, Optional
 
 import config
-from calculations import compute_prob_edge, lognormal_win_probability
+from calculations import compute_prob_edge, compute_sniper_net_profit_ratio, lognormal_win_probability
 from executioner import OrderBookSnapshot, PortfolioSnapshot, Side, build_order_manager
 from oracle import MarketSnapshot, Oracle
+from strategy_executor import StrategyExecutor
 
 log = logging.getLogger("brain")
 
@@ -87,6 +88,18 @@ class PlanDecision:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class LockedHedgePlan:
+    """Result of _build_hedge_plan: minimum hedge that locks >= -$0.01 on both outcomes."""
+    side: Side
+    token_id: str
+    hedge_price: float
+    hedge_amount: float   # USDC spent
+    hedge_shares: float   # shares bought
+    entry_net: float      # net pnl if entry side wins
+    hedge_net: float      # net pnl if hedge side wins
+
+
 @dataclass
 class MarketState:
     condition_id: str
@@ -132,10 +145,25 @@ class MarketState:
     next_settlement_attempt_at: float = 0.0
     settlement_price_at_expiry: float = 0.0
     settlement_winning_side: Optional[Side] = None
+    # Per-side dual-position tracking (both sides can be open simultaneously)
+    up_token_id: str = ""
+    up_cost: float = 0.0
+    up_shares: float = 0.0
+    up_avg_entry_price: float = 0.0
+    down_token_id: str = ""
+    down_cost: float = 0.0
+    down_shares: float = 0.0
+    down_avg_entry_price: float = 0.0
+    # Routing mode set by _evaluate_market
+    mode: str = ""
 
     @property
     def has_position(self) -> bool:
-        return self.position_shares > 1e-9 and self.position_cost > 1e-9
+        if self.position_shares > 1e-9 and self.position_cost > 1e-9:
+            return True
+        if self.up_shares > 1e-9 or self.down_shares > 1e-9:
+            return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -191,6 +219,23 @@ class Brain:
         self._session_start_balance = float(
             getattr(self._exec, "total_equity", config.INITIAL_BALANCE)
         )
+        # ── New 3-phase strategy executor ──────────────────────────────────────
+        # Handles Phase 1 (Entry), Phase 2 (Monitor), Phase 3 (Sniper).
+        # Uses the same _exec and _oracle as the rest of Brain.
+        # All existing settlement / dashboard / signal helpers are untouched.
+        self._strategy_executor = StrategyExecutor(self._exec, self._oracle)
+
+    @staticmethod
+    def _effective_total_equity(total_equity: float) -> float:
+        """Cap effective bankroll at TRADING_BANKROLL_CAP_USDC if configured.
+
+        Used in main.py to compute session_start_balance for live trading.
+        If the cap is 0 (disabled), returns total_equity unchanged.
+        """
+        cap = config.TRADING_BANKROLL_CAP_USDC
+        if cap > 0.0:
+            return min(total_equity, cap)
+        return total_equity
 
     @property
     def win_rate(self) -> float:
@@ -315,6 +360,14 @@ class Brain:
         await asyncio.gather(*[self._evaluate_market(snap) for snap in active_markets])
 
     async def _evaluate_market(self, snap: MarketSnapshot) -> None:
+        """Per-market evaluation with explicit routing.
+
+        Routing logic:
+          1. Dual position (both UP and DOWN open) → _monitor_dual_position
+          2. time_remaining <= PHASE2_WINDOW_END and no position → Hold Mode, no entry
+          3. Otherwise → _maybe_enter_position (handles Phase 1 entry,
+             Phase 2 monitor, Phase 3 sniper via StrategyExecutor)
+        """
         state = self._state_for(snap)
         await self._process_limit_orders(snap, state)
         await self._refresh_market_position_state(state)
@@ -322,36 +375,59 @@ class Brain:
         if snap.time_remaining <= 0:
             return
 
-        # Straddle fires once at market open (before hedges / Phase 1 / Phase 2).
-        await self._maybe_execute_straddle(snap, state)
+        up_book, down_book = await asyncio.gather(
+            self._book_for_side(snap, Side.UP, snap.up_token_id),
+            self._book_for_side(snap, Side.DOWN, snap.down_token_id),
+        )
+
+        # Dual position: both sides open → dedicated dual monitor
+        if state.up_shares > 1e-9 and state.down_shares > 1e-9:
+            await self._monitor_dual_position(
+                snap=snap, state=state, up_book=up_book, down_book=down_book,
+            )
+            await self._refresh_market_position_state(state)
+            return
+
+        # No-entry hold window: stop new entries only after sniper window closes.
+        # strategy_executor handles all routing (Phase 1 / Phase 3 / emergency close).
+        if snap.time_remaining <= config.PHASE2_WINDOW_END and not state.has_position:
+            state.mode = "Hold Mode"
+            return
+
+        await self._maybe_enter_position(
+            snap=snap, state=state, up_book=up_book, down_book=down_book,
+        )
         await self._refresh_market_position_state(state)
 
-        await self._run_layered_hedges(snap, state)
+    async def _maybe_enter_position(
+        self,
+        *,
+        snap: MarketSnapshot,
+        state: MarketState,
+        up_book: Optional[OrderBookSnapshot],
+        down_book: Optional[OrderBookSnapshot],
+    ) -> None:
+        """Route to 3-phase StrategyExecutor for entry/monitor/sniper logic."""
+        if not hasattr(self, "_strategy_executor"):
+            self._strategy_executor = StrategyExecutor(self._exec, self._oracle)
+        await self._strategy_executor.evaluate(
+            snap=snap, market_state=state, up_book=up_book, down_book=down_book,
+        )
 
-        if self._phase2_window_open(snap):
-            await self.execute_phase_2(snap, state)
-            return
-
-        if state.mixed_exposure:
-            state.phase1_status = Phase1Status.HOLDING
-            label = "Straddle active" if state.straddle_placed else "Layered hedge active"
-            state.phase1_detail = f"{label}; holding both sides"
-            return
-
-        if state.has_position:
-            if state.position_source == "PHASE2":
-                state.phase1_status = Phase1Status.HOLDING
-                state.phase1_detail = "TWAP sniper owns exposure"
-            else:
-                await self.execute_phase_1(snap, state)
-            return
-
-        if snap.time_remaining > config.PHASE2_WINDOW_START:
-            await self.execute_phase_1(snap, state)
-            return
-
-        state.phase1_status = Phase1Status.IDLE
-        state.phase1_detail = "Waiting for hedge/sniper windows"
+    async def _monitor_dual_position(
+        self,
+        *,
+        snap: MarketSnapshot,
+        state: MarketState,
+        up_book: Optional[OrderBookSnapshot],
+        down_book: Optional[OrderBookSnapshot],
+    ) -> None:
+        """Monitor a dual (both-sides) position — TP candidates, hold to settlement."""
+        if not hasattr(self, "_strategy_executor"):
+            self._strategy_executor = StrategyExecutor(self._exec, self._oracle)
+        await self._strategy_executor.evaluate(
+            snap=snap, market_state=state, up_book=up_book, down_book=down_book,
+        )
 
     async def _process_limit_orders(self, snap: MarketSnapshot, state: MarketState) -> None:
         fills = await self._exec.process_limit_crosses(
@@ -711,6 +787,16 @@ class Brain:
                     # Always use the live book ask — both SIM and LIVE fetch
                     # winning_book fresh above, so this keeps both modes identical.
                     expected_fill_price = winning_book.best_ask
+                    live_profit_ratio = compute_sniper_net_profit_ratio(
+                        expected_fill_price, config.SNIPER_SLIPPAGE_ESTIMATE
+                    )
+                    if live_profit_ratio < config.SNIPER_MIN_PROFIT_RATIO:
+                        self._abort_phase2(
+                            state,
+                            f"Live ask margin too thin after slippage | ask={expected_fill_price:.4f}"
+                            f" | net={live_profit_ratio:.4f} < min={config.SNIPER_MIN_PROFIT_RATIO:.4f}",
+                        )
+                        return
                     target_shares = chunk_size / expected_fill_price if expected_fill_price > 0 else 0.0
                     fill = await self._exec.execute_taker_buy(
                         condition_id=snap.condition_id,
@@ -1363,6 +1449,17 @@ class Brain:
                 plan=None,
                 reason=f"winning_ask={winning_book.best_ask:.4f} is not < 1.00",
             )
+        net_profit_ratio = compute_sniper_net_profit_ratio(
+            winning_book.best_ask, config.SNIPER_SLIPPAGE_ESTIMATE
+        )
+        if net_profit_ratio < config.SNIPER_MIN_PROFIT_RATIO:
+            return PlanDecision(
+                plan=None,
+                reason=(
+                    f"margin after slippage too thin | ask={winning_book.best_ask:.4f}"
+                    f" | net={net_profit_ratio:.4f} < min={config.SNIPER_MIN_PROFIT_RATIO:.4f}"
+                ),
+            )
         if losing_book.best_ask <= 0:
             return PlanDecision(plan=None, reason="Losing-side ask is unavailable")
 
@@ -1847,6 +1944,106 @@ class Brain:
         return "NEUTRAL"
 
     @staticmethod
+    def _obi_side(obi_value: float) -> Optional[Side]:
+        """Map OBI value to directional side using SAFE_MARGIN_OBI band.
+
+        Returns UP if obi > 0.5 + SAFE_MARGIN_OBI/2,
+                DOWN if obi < 0.5 - SAFE_MARGIN_OBI/2,
+                None in the neutral band.
+        """
+        half_band = config.SAFE_MARGIN_OBI / 2.0
+        if obi_value > 0.5 + half_band:
+            return Side.UP
+        if obi_value < 0.5 - half_band:
+            return Side.DOWN
+        return None
+
+    def _scaled_entry_amount(
+        self,
+        total_equity: float,
+        available_balance: float,
+        ask_price: float,
+    ) -> float:
+        """Scale ENTRY_AMOUNT linearly with total equity relative to INITIAL_BALANCE."""
+        if config.INITIAL_BALANCE <= 0:
+            return config.ENTRY_AMOUNT
+        return total_equity * (config.ENTRY_AMOUNT / config.INITIAL_BALANCE)
+
+    def _build_hedge_plan(
+        self,
+        *,
+        state: MarketState,
+        hedge_side: Side,
+        hedge_book: OrderBookSnapshot,
+        max_hedge_amount: float,
+    ) -> Optional[LockedHedgePlan]:
+        """Find minimum hedge spend that locks break-even on both outcomes.
+
+        Both conditions must hold:
+          entry_net = entry_shares - entry_cost - hedge_amount >= -T
+          hedge_net = hedge_shares - entry_cost - hedge_amount >= -T
+        where hedge_shares = hedge_amount / hedge_price and T = 0.01.
+        """
+        if hedge_side == Side.DOWN:
+            entry_shares = state.up_shares
+            entry_cost = state.up_cost
+        else:
+            entry_shares = state.down_shares
+            entry_cost = state.down_cost
+
+        hedge_price = hedge_book.best_ask
+        if hedge_price <= 0 or hedge_price >= 1.0:
+            return None
+
+        T = 0.01
+        # Upper bound from entry_net: hedge_amount <= entry_shares - entry_cost + T
+        upper = entry_shares - entry_cost + T
+        # Lower bound from hedge_net: hedge_amount >= (entry_cost - T) * p / (1 - p)
+        lower = (entry_cost - T) * hedge_price / max(1.0 - hedge_price, 1e-9)
+
+        effective_lo = max(config.MIN_ORDER_USDC, lower)
+        effective_hi = min(max_hedge_amount, upper)
+
+        if effective_lo > effective_hi + 1e-9:
+            return None
+
+        hedge_amount = effective_lo
+        hedge_shares = hedge_amount / hedge_price
+        entry_net = entry_shares - entry_cost - hedge_amount
+        hedge_net = hedge_shares - entry_cost - hedge_amount
+
+        return LockedHedgePlan(
+            side=hedge_side,
+            token_id=hedge_book.token_id,
+            hedge_price=hedge_price,
+            hedge_amount=hedge_amount,
+            hedge_shares=hedge_shares,
+            entry_net=entry_net,
+            hedge_net=hedge_net,
+        )
+
+    def _dual_take_profit_candidates(
+        self,
+        *,
+        state: MarketState,
+        up_book: OrderBookSnapshot,
+        down_book: OrderBookSnapshot,
+    ) -> tuple[Optional[Side], Optional[Side]]:
+        """Return which sides currently have positive unrealised PnL."""
+        up_candidate: Optional[Side] = None
+        down_candidate: Optional[Side] = None
+
+        if state.up_shares > 1e-9 and state.up_cost > 1e-9:
+            if state.up_shares * up_book.best_bid > state.up_cost:
+                up_candidate = Side.UP
+
+        if state.down_shares > 1e-9 and state.down_cost > 1e-9:
+            if state.down_shares * down_book.best_bid > state.down_cost:
+                down_candidate = Side.DOWN
+
+        return up_candidate, down_candidate
+
+    @staticmethod
     def _winning_side_from_oracle(snap: MarketSnapshot) -> Optional[Side]:
         if snap.binance_live_price <= 0 or snap.strike_price <= 0:
             return None
@@ -1968,7 +2165,9 @@ class Brain:
 
         has_live_exposure = state.has_position
         if has_live_exposure and state.settlement_winning_side is None:
-            if now < snap.end_time + config.SETTLEMENT_INITIAL_CLAIM_DELAY:
+            # Skip on-chain claim delay in DRY_RUN — no blockchain wait needed.
+            claim_delay = 0.0 if config.DRY_RUN else config.SETTLEMENT_INITIAL_CLAIM_DELAY
+            if now < snap.end_time + claim_delay:
                 return
 
         oracle_price = state.settlement_price_at_expiry or snap.binance_live_price
@@ -2005,6 +2204,45 @@ class Brain:
                 state.settlement_price_at_expiry,
                 reason_text,
             )
+            # After 3 minutes of failed on-chain settlement, force-clear in-memory state so
+            # the dashboard no longer shows stale positions / locked exposure. The actual
+            # balance is reconciled on the next sync_live_balance() call.
+            _FORCE_CLEAR_AFTER = 180.0
+            if has_live_exposure and now > snap.end_time + _FORCE_CLEAR_AFTER:
+                log.warning(
+                    "[%s] Force-clearing stale positions after %.0fs | %s | winner=%s",
+                    snap.condition_id[:10],
+                    now - snap.end_time,
+                    state.market_label,
+                    winning_side.value,
+                )
+                forced = await self._exec.clear_expired_market(
+                    condition_id=snap.condition_id,
+                    market_label=state.market_label,
+                    asset=snap.asset,
+                    timeframe=snap.timeframe,
+                    winning_side=winning_side,
+                )
+                state.settled = True
+                state.next_settlement_attempt_at = 0.0
+                if forced.realized_pnl > 0:
+                    self._wins += 1
+                elif forced.realized_pnl < 0:
+                    self._losses += 1
+                log.info(
+                    "[%s] Force-settled | %s | winner=%s | realized=%+.4f",
+                    snap.condition_id[:10],
+                    state.market_label,
+                    winning_side.value,
+                    forced.realized_pnl,
+                )
+                if not config.DRY_RUN and hasattr(self._exec, "sync_live_balance"):
+                    try:
+                        await self._exec.sync_live_balance()
+                    except Exception as exc:
+                        log.warning(
+                            "[LIVE] Balance sync after force-settle failed: %s", exc
+                        )
             return
 
         if result.realized_pnl > 0:

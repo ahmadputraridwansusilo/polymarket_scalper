@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -27,10 +28,13 @@ if TYPE_CHECKING:
 
 _TERM_NAME = os.getenv("TERM", "").lower().strip()
 _TERM_IS_DUMB = _TERM_NAME in {"", "dumb", "unknown"}
+_STDOUT_IS_TTY = sys.stdout.isatty()
+_STDERR_IS_TTY = sys.stderr.isatty()
+_RICH_LIVE_CAPABLE = _STDOUT_IS_TTY and _STDERR_IS_TTY and not _TERM_IS_DUMB
 
 console = Console(
-    force_terminal=None if _TERM_IS_DUMB else True,
-    force_interactive=False if _TERM_IS_DUMB else None,
+    force_terminal=True if _RICH_LIVE_CAPABLE else False,
+    force_interactive=True if _RICH_LIVE_CAPABLE else False,
 )
 TEXT_DASHBOARD: bool = os.getenv("TEXT_DASHBOARD", "false").lower().strip() == "true"
 DASHBOARD_RENDER_MODE: str = os.getenv(
@@ -43,11 +47,15 @@ def _resolve_dashboard_render_mode(
     term_name: str | None = None,
     text_dashboard: bool | None = None,
     requested_mode: str | None = None,
+    stdout_is_tty: bool | None = None,
+    stderr_is_tty: bool | None = None,
 ) -> str:
     term = (_TERM_NAME if term_name is None else term_name).lower().strip()
     text_mode = TEXT_DASHBOARD if text_dashboard is None else text_dashboard
     mode = DASHBOARD_RENDER_MODE if requested_mode is None else requested_mode
     mode = mode.lower().strip()
+    stdout_tty = _STDOUT_IS_TTY if stdout_is_tty is None else stdout_is_tty
+    stderr_tty = _STDERR_IS_TTY if stderr_is_tty is None else stderr_is_tty
 
     if text_mode or mode == "text":
         return "text"
@@ -55,6 +63,8 @@ def _resolve_dashboard_render_mode(
         return "static"
     if mode == "live":
         return "live"
+    if not stdout_tty or not stderr_tty:
+        return "text"
     if term in {"", "dumb", "unknown"}:
         return "static"
     return "live"
