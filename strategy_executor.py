@@ -91,27 +91,32 @@ PHASE1_ENTRY_COOLDOWN: float = 3.0               # seconds between entry attempt
 PHASE2_TP_PCT: float = 50.0                      # unrealised PnL% threshold for take-profit
 PHASE2_HEDGE_TOLERANCE: float = 0.01             # both sides must be ≥ –$0.01
 PHASE2_EMERGENCY_CLOSE_SECONDS: float = 10.0     # close losing unhedged positions at this threshold
+PHASE2_MAX_HEDGE_ATTEMPTS: int = 3               # give up hedging after this many fill failures
 
 # ---------------------------------------------------------------------------
-# Phase 3 Sniper — high-conviction near-expiry entry
+# Phase 3 Sniper — two-condition near-expiry and pre-expiry entry
 #
-# Window : 10 s < time_remaining ≤ 60 s
-# Entry  : price in [0.90, 0.99] — high-conviction zone
-# Size   : 15 % of bankroll (base); 20 % when OBI is very strong (≥ 0.85)
-# Order  : GTC limit at current best_ask — polls up to 60s for fill, then cancels
-# Momentum gate: OBI must still be strongly aligned at fire time
-#   UP  side → OBI ≥ PHASE3_MOMENTUM_OBI_STRONG (0.60)
-#   DOWN side → OBI ≤ 1 − PHASE3_MOMENTUM_OBI_STRONG (0.40)
+# Condition A (Pre-60s): tr > SNIPER_EARLY_WINDOW_SEC (60s)
+#   price in [SNIPER_PRICE_MIN, SNIPER_PRICE_MAX] (0.95–0.99) on winning side
+#   delta > SAFE_MARGIN  (via oracle_safe)
+#
+# Condition B (Late, ≤30s): tr ≤ SNIPER_LATE_WINDOW_SEC (30s)
+#   delta > SAFE_MARGIN AND OBI same direction OR neutral
+#   price range NOT required
+#
+# Both: fixed size = SNIPER_POSITION_SIZE_USD; profitability checked with
+#   slippage + fee model before any order is placed.
+# Order: GTC limit at best_ask; polls PHASE3_LIMIT_TIMEOUT s, then cancels.
 # ---------------------------------------------------------------------------
-PHASE3_WINDOW_START: float = 60.0                # sniper window opens at 60 s remaining
-PHASE3_WINDOW_END: float = 10.0                  # sniper window closes at 10 s remaining
-PHASE3_MIN_WINNING_PRICE: float = 0.90           # floor — don't enter below this
-PHASE3_MAX_WINNING_PRICE: float = 0.99           # ceiling — don't overpay past this
-PHASE3_SIZE_RATIO_BASE: float = 0.15             # 15 % of balance (base)
-PHASE3_SIZE_RATIO_HIGH: float = 0.20             # 20 % when OBI is very strong
+PHASE3_WINDOW_START: float = 60.0                # Phase 3 time window opens (seconds)
+PHASE3_WINDOW_END: float = 10.0                  # Phase 3 time window closes (seconds)
+PHASE3_MIN_WINNING_PRICE: float = 0.95           # kept for backward-compat / test imports
+PHASE3_MAX_WINNING_PRICE: float = 0.99           # kept for backward-compat / test imports
+PHASE3_SIZE_RATIO_BASE: float = 0.15             # unused after refactor; kept for test imports
+PHASE3_SIZE_RATIO_HIGH: float = 0.20             # unused after refactor; kept for test imports
 PHASE3_SIZE_RATIO: float = PHASE3_SIZE_RATIO_BASE  # alias for test compat
-PHASE3_OBI_HIGH_THRESHOLD: float = 0.85          # OBI ≥ this → use SIZE_RATIO_HIGH
-PHASE3_MOMENTUM_OBI_STRONG: float = 0.60         # minimum OBI magnitude to confirm momentum intact
+PHASE3_OBI_HIGH_THRESHOLD: float = 0.85          # unused after refactor; kept for test imports
+PHASE3_MOMENTUM_OBI_STRONG: float = 0.60         # unused after refactor; kept for test imports
 PHASE3_LIMIT_TIMEOUT: float = 60.0              # cancel GTC limit after this many seconds if unfilled
 PHASE3_LIMIT_POLL_INTERVAL: float = 2.0         # poll interval for fill check
 
@@ -145,9 +150,10 @@ class StrategyState:
     hedge_shares: float = 0.0
     hedge_cost: float = 0.0
     last_hedge_attempt_at: float = 0.0
+    hedge_fail_count: int = 0
 
     # Phase 3 sniper tracking
-    phase3_sniper_fired: bool = False
+    sniper_entered: bool = False       # True once Condition A or B fires (no re-entry)
     phase3_order_id: str = ""
 
     # Dashboard
@@ -435,451 +441,189 @@ class StrategyExecutor:
         if obi_side is None and oracle_safe:
             obi_side = winning_side
 
-        # ── Phase 3 Sniper (highest priority in window) ──────────────────────
+        # ── Phase 3 window (Condition B + pending-order status) ──────────────
         if PHASE3_WINDOW_END < tr <= PHASE3_WINDOW_START:
-            if not sstate.phase3_sniper_fired:
-                await self._phase3_sniper(
-                    snap=snap,
-                    market_state=market_state,
-                    sstate=sstate,
-                    oracle_safe=oracle_safe,
-                    delta_abs=delta_abs,
-                    margin=margin,
-                    winning_side=winning_side,
-                    obi_side=obi_side,
-                    obi_value=obi_value,
-                    up_book=up_book,
-                    down_book=down_book,
-                )
-            else:
-                if sstate.phase3_order_id:
-                    market_state.phase1_detail = f"Sniper limit pending | order={sstate.phase3_order_id[:8]}"
+            if not sstate.sniper_entered:
+                if self.check_condition_b(tr, oracle_safe, winning_side, obi_side):
+                    cond_b_book = up_book if winning_side == Side.UP else down_book
+                    if cond_b_book is not None and cond_b_book.best_ask > 0:
+                        log.info(
+                            "Condition B triggered: delta=%.2f obi=%.3f at T-%.0fs | market=%s",
+                            delta_abs, obi_value, tr, market_state.market_label,
+                        )
+                        print(
+                            f"Condition B triggered: delta={delta_abs:.2f}"
+                            f" obi={obi_value:.3f} at T-{tr:.0f}s"
+                        )
+                        await self.execute_entry(
+                            snap=snap,
+                            market_state=market_state,
+                            sstate=sstate,
+                            entry_side=winning_side,
+                            entry_book=cond_b_book,
+                            condition="B",
+                            tr=tr,
+                            obi_value=obi_value,
+                        )
+                    else:
+                        market_state.phase1_detail = f"Sniper Cond B: no book | t={tr:.0f}s"
                 else:
-                    market_state.phase1_detail = f"Sniper already fired | t={tr:.0f}s"
+                    market_state.phase1_detail = (
+                        f"Sniper Cond B blocked | delta={delta_abs:.2f}"
+                        f" obi={obi_value:.3f} t={tr:.0f}s"
+                    )
+            elif sstate.phase3_order_id:
+                market_state.phase1_detail = f"Sniper limit pending | order={sstate.phase3_order_id[:8]}"
+            else:
+                market_state.phase1_detail = f"Sniper entered | holding | t={tr:.0f}s"
             return
 
-        # ── Phase 2 Monitor (existing position) ──────────────────────────────
-        has_position = (
-            market_state.position_source in {"PHASE1", "PHASE3"}
-            and market_state.position_side is not None
-            and not market_state.settled
-        )
-        if has_position:
-            await self._phase2_monitor(
-                snap=snap,
-                market_state=market_state,
-                sstate=sstate,
-                oracle_safe=oracle_safe,
-                winning_side=winning_side,
-                obi_side=obi_side,
-                obi_value=obi_value,
-                up_book=up_book,
-                down_book=down_book,
-            )
-            return
+    def check_condition_b(
+        self,
+        tr: float,
+        oracle_safe: bool,
+        entry_side: Optional[Side],
+        obi_side: Optional[Side],
+    ) -> bool:
+        """Condition B: returns True when delta > safe_margin, OBI not against.
 
-        # ── Phase 1 Entry ────────────────────────────────────────────────────
-        if tr > PHASE1_ENTRY_MIN_TIME_REMAINING:
-            await self._phase1_entry(
-                snap=snap,
-                market_state=market_state,
-                sstate=sstate,
-                oracle_safe=oracle_safe,
-                delta_abs=delta_abs,
-                margin=margin,
-                winning_side=winning_side,
-                obi_side=obi_side,
-                obi_value=obi_value,
-                up_book=up_book,
-                down_book=down_book,
-            )
-        else:
-            market_state.phase1_detail = f"Waiting sniper window | t={tr:.0f}s"
+        Time gating is handled by evaluate() (Phase 3 window). No redundant gate here.
+        """
+        if not oracle_safe or entry_side is None:
+            return False
+        # OBI must be same direction as the trade OR neutral (not pointing against it).
+        if obi_side is not None and obi_side != entry_side:
+            return False
+        return True
 
-    # ── Phase 1: Entry ───────────────────────────────────────────────────────
+    @staticmethod
+    def is_profitable(
+        side: Side,
+        price: float,
+        size_usd: float,
+    ) -> tuple[bool, float]:
+        """Returns (profitable, net_profit) after dynamic taker fee.
 
-    async def _phase1_entry(
+        Polymarket 15-min crypto markets charge a price-dependent taker fee:
+          fee_rate     = 4 * p * (1-p) * PEAK_FEE_RATE  (peaks ~2% at p=0.5)
+          platform_fee = size_usd * fee_rate
+          total_cost   = size_usd + platform_fee
+          expected_payout = size_usd / price   # shares × $1.00
+          net_profit   = expected_payout - total_cost
+        """
+        if price <= 0 or size_usd <= 0:
+            return False, -size_usd
+        platform_fee = size_usd * config.dynamic_fee_rate(price)
+        total_cost = size_usd + platform_fee
+        expected_payout = size_usd / price
+        net_profit = expected_payout - total_cost
+        return net_profit > 0, net_profit
+
+    async def execute_entry(
         self,
         *,
         snap: MarketSnapshot,
         market_state,
         sstate: StrategyState,
-        oracle_safe: bool,
-        delta_abs: float,
-        margin: float,
-        winning_side: Optional[Side],
-        obi_side: Optional[Side],
+        entry_side: Side,
+        entry_book,
+        condition: str,
+        tr: float,
         obi_value: float,
-        up_book,
-        down_book,
     ) -> None:
-        from brain import Phase1Status, Phase2Status
+        """Place a sniper limit order after all condition gates have passed.
+
+        Called for both Condition A and Condition B.  Sets sniper_entered=True
+        only on a successful order placement (not on profitability block).
+        """
+        from brain import Phase2Status
 
         mode_tag = "[SIM]" if config.DRY_RUN else "[LIVE]"
-        tr = snap.time_remaining
-
-        # Gate 1: Oracle delta must exceed safe margin
-        if not oracle_safe:
-            market_state.phase1_detail = (
-                f"oracle unsafe | δ={delta_abs:.2f} ≤ margin={margin:.2f} | t={tr:.0f}s"
-            )
-            log.debug(
-                "[PHASE1] Blocked | market=%s | delta=%.2f ≤ margin=%.2f | t=%.0fs",
-                market_state.market_label, delta_abs, margin, tr,
-            )
-            return
-
-        # Gate 2: OBI must align with oracle direction
-        if winning_side is None or obi_side is None or obi_side != winning_side:
-            market_state.phase1_detail = (
-                f"OBI/oracle diverge | OBI={obi_side.value if obi_side else '-'}"
-                f" oracle={winning_side.value if winning_side else '-'} | t={tr:.0f}s"
-            )
-            return
-
-        # Gate 3: Cooldown between attempts
-        now = time.monotonic()
-        if now - sstate.last_entry_attempt_at < PHASE1_ENTRY_COOLDOWN:
-            market_state.phase1_detail = (
-                f"Cooldown | next={PHASE1_ENTRY_COOLDOWN - (now - sstate.last_entry_attempt_at):.1f}s"
-            )
-            return
-        sstate.last_entry_attempt_at = now
-
-        # Select entry side book and token
-        entry_side = winning_side
-        entry_book = up_book if entry_side == Side.UP else down_book
         entry_token = snap.up_token_id if entry_side == Side.UP else snap.down_token_id
-
-        if entry_book is None or entry_book.best_ask <= 0 or not entry_token:
-            market_state.phase1_detail = "No order book for entry side"
-            return
-
         current_price = entry_book.best_ask
+        size_usd = config.SNIPER_POSITION_SIZE_USD
 
-        portfolio = await self._exec.get_portfolio_snapshot()
-        balance = portfolio.available_balance
-        entry_size = compute_entry_size(balance)
-
-        if entry_size < config.MIN_ORDER_USDC:
-            market_state.phase1_detail = (
-                f"Entry size ${entry_size:.2f} below minimum ${config.MIN_ORDER_USDC:.2f}"
-            )
+        # Profit gate — slippage + fee model
+        profitable, net_profit = self.is_profitable(entry_side, current_price, size_usd)
+        if not profitable:
+            msg = f"Entry BLOCKED: unprofitable (net_profit=${net_profit:.4f} after slippage+fees)"
+            log.info("%s | market=%s", msg, market_state.market_label)
+            print(msg)
+            market_state.phase2_status = Phase2Status.BLOCKED
+            market_state.abort_reason = f"Sniper: unprofitable (net=${net_profit:.4f})"
             return
 
-        target_shares = entry_size / current_price
+        # Exchange minimum-shares guard — bump size_usd instead of blocking
+        sniper_shares = size_usd / current_price if current_price > 0 else 0.0
+        if sniper_shares < config.MIN_ORDER_SHARES:
+            size_usd = config.MIN_ORDER_SHARES * current_price
+            sniper_shares = config.MIN_ORDER_SHARES
+            log.info(
+                "SNIPER: bumped size to $%.2f to meet MIN_ORDER_SHARES=%.0f | market=%s",
+                size_usd, config.MIN_ORDER_SHARES, market_state.market_label,
+            )
 
         log.info(
-            "%s Phase 1 Entry FIRED | market=%s | side=%s"
-            " | ask=%.4f | size=$%.2f | OBI=%.3f | δ=%.2f | t=%.0fs",
-            mode_tag, market_state.market_label, entry_side.value,
-            current_price, entry_size, obi_value, delta_abs, tr,
+            "SNIPER ENTRY: side=%s size=$%.2f price=%.4f market=%s (Condition %s)",
+            entry_side.value, size_usd, current_price, market_state.market_label, condition,
+        )
+        print(
+            f"SNIPER ENTRY: side={entry_side.value} size=${size_usd:.2f}"
+            f" price={current_price:.4f} market={market_state.market_label}"
         )
 
-        fill = await self._exec.execute_taker_buy(
+        # Claim the shot before awaiting — prevents retry on the next tick
+        # even if the order is rejected or unfilled.
+        sstate.sniper_entered = True
+
+        # Use execute_sniper (taker/FOK) — GTC limits are rejected by Polymarket near expiry.
+        fill: Optional[Fill] = await self._exec.execute_sniper(
             condition_id=snap.condition_id,
             market_label=market_state.market_label,
             asset=snap.asset,
             timeframe=snap.timeframe,
             token_id=entry_token,
             side=entry_side,
-            phase="PHASE1",
-            aggressive_price=config.SNIPER_LIMIT_PRICE,
-            expected_fill_price=current_price,
-            target_shares=target_shares,
-            max_size_usdc=entry_size,
+            size_usdc=size_usd,
+            current_best_ask=current_price,
         )
 
-        if fill:
-            sstate.entry_delta = delta_abs
-            sstate.entry_obi = obi_value
-            market_state.position_source = "PHASE1"
-            market_state.position_side = entry_side
-            market_state.position_token_id = entry_token
-            market_state.position_cost = fill.size
-            market_state.position_shares = fill.shares
-            market_state.avg_entry_price = fill.price
-            market_state.phase1_status = Phase1Status.HOLDING
-            market_state.phase1_detail = (
-                f"Entered {entry_side.value} | ask={current_price:.3f} | size=${fill.size:.2f}"
-            )
-            log.info(
-                "%s Phase 1 Entry FILLED | market=%s | side=%s"
-                " | price=%.4f | shares=%.4f | cost=$%.2f",
-                mode_tag, market_state.market_label, fill.side,
-                fill.price, fill.shares, fill.size,
-            )
-        else:
-            market_state.phase1_detail = f"Entry miss | ask={current_price:.3f} | t={tr:.0f}s"
-
-    # ── Phase 2: Monitor ─────────────────────────────────────────────────────
-
-    async def _phase2_monitor(
-        self,
-        *,
-        snap: MarketSnapshot,
-        market_state,
-        sstate: StrategyState,
-        oracle_safe: bool,
-        winning_side: Optional[Side],
-        obi_side: Optional[Side],
-        obi_value: float,
-        up_book,
-        down_book,
-    ) -> None:
-        from brain import Phase1Status, Phase2Status
-
-        mode_tag = "[SIM]" if config.DRY_RUN else "[LIVE]"
-        tr = snap.time_remaining
-        position_side = market_state.position_side
-        position_cost = market_state.position_cost
-        position_shares = market_state.position_shares
-
-        pos_book = up_book if position_side == Side.UP else down_book
-        if pos_book is None or pos_book.best_bid <= 0:
-            market_state.phase1_detail = "Monitoring — no book"
-            return
-
-        current_bid = pos_book.best_bid
-        unrealised_pnl = position_shares * current_bid - position_cost
-        unrealised_pct = (unrealised_pnl / position_cost * 100.0) if position_cost > 0 else 0.0
-
-        market_state.phase1_detail = (
-            f"Monitoring {position_side.value} | bid={current_bid:.3f}"
-            f" | PnL={unrealised_pct:+.1f}% | t={tr:.0f}s"
-        )
-
-        # Priority 3: Emergency close at t ≤ 10s for losing unhedged positions
-        if tr <= PHASE2_EMERGENCY_CLOSE_SECONDS and not sstate.hedged:
-            await self._phase2_emergency_close(
-                snap=snap,
-                market_state=market_state,
-                unrealised_pnl=unrealised_pnl,
-                current_bid=current_bid,
-                mode_tag=mode_tag,
+        if fill is None:
+            market_state.phase2_status = Phase2Status.ABORTED
+            market_state.abort_reason = "Sniper: taker order failed"
+            log.warning(
+                "%s SNIPER REJECTED (no retry) | market=%s | side=%s | ask=%.4f | size=$%.2f | t=%.1fs"
+                " — check live order book depth at this price level",
+                mode_tag, market_state.market_label, entry_side.value,
+                current_price, size_usd, tr,
             )
             return
 
-        # Priority 1: Hedge detection (if not hedged)
-        if not sstate.hedged:
-            now = time.monotonic()
-            if now - sstate.last_hedge_attempt_at >= 1.0:
-                sstate.last_hedge_attempt_at = now
-                await self._attempt_hedge(
-                    snap=snap,
-                    market_state=market_state,
-                    sstate=sstate,
-                    position_cost=position_cost,
-                    position_shares=position_shares,
-                    position_side=position_side,
-                    up_book=up_book,
-                    down_book=down_book,
-                    mode_tag=mode_tag,
-                )
-
-        # Priority 2: Take-profit (only when not hedged)
-        if not sstate.hedged and unrealised_pct >= PHASE2_TP_PCT:
-            await self._check_take_profit(
-                snap=snap,
-                market_state=market_state,
-                position_side=position_side,
-                unrealised_pct=unrealised_pct,
-                current_bid=current_bid,
-                mode_tag=mode_tag,
-            )
-
-    # ── Phase 2: Attempt hedge ───────────────────────────────────────────────
-
-    async def _attempt_hedge(
-        self,
-        *,
-        snap: MarketSnapshot,
-        market_state,
-        sstate: StrategyState,
-        position_cost: float,
-        position_shares: float,
-        position_side: Side,
-        up_book,
-        down_book,
-        mode_tag: str,
-    ) -> None:
-        from brain import Phase2Status
-
-        hedge_side = Side.DOWN if position_side == Side.UP else Side.UP
-        hedge_book = down_book if position_side == Side.UP else up_book
-        hedge_token = snap.down_token_id if position_side == Side.UP else snap.up_token_id
-
-        if hedge_book is None or hedge_book.best_ask <= 0 or not hedge_token:
-            return
-
-        hedge_price = hedge_book.best_ask
-
-        portfolio = await self._exec.get_portfolio_snapshot()
-        balance = portfolio.available_balance
-        max_hedge = min(position_cost, max(balance, 0.01))
-
-        hedge_plan = find_valid_hedge(
-            entry_cost=position_cost,
-            entry_shares=position_shares,
-            hedge_price=hedge_price,
-            max_hedge_usdc=max_hedge,
-        )
-
-        if hedge_plan is None:
-            market_state.hedge_detail = (
-                f"No valid hedge | price={hedge_price:.3f} | entry_cost=${position_cost:.2f}"
-            )
-            return
-
-        hedge_size = hedge_plan.hedge_amount
-        hedge_shares = hedge_size / hedge_price if hedge_price > 0 else 0.0
-
-        fill = await self._exec.execute_taker_buy(
-            condition_id=snap.condition_id,
-            market_label=market_state.market_label,
-            asset=snap.asset,
-            timeframe=snap.timeframe,
-            token_id=hedge_token,
-            side=hedge_side,
-            phase="PHASE2_HEDGE",
-            aggressive_price=config.SNIPER_LIMIT_PRICE,
-            expected_fill_price=hedge_price,
-            target_shares=hedge_shares,
-            max_size_usdc=hedge_size,
-        )
-
-        if fill:
-            sstate.hedged = True
-            sstate.hedge_side = hedge_side
-            sstate.hedge_cost = fill.size
-            sstate.hedge_shares = fill.shares
-            market_state.phase2_status = Phase2Status.EXECUTED
-            market_state.hedge_detail = (
-                f"Hedged {hedge_side.value} | price={fill.price:.3f}"
-                f" | cost=${fill.size:.2f} | shares={fill.shares:.4f}"
-            )
-            log.info(
-                "%s Phase 2 Hedge PLACED | market=%s | hedge_side=%s"
-                " | price=%.3f | cost=$%.2f | net_entry=$%.4f | net_hedge=$%.4f",
-                mode_tag, market_state.market_label, hedge_side.value,
-                fill.price, fill.size,
-                hedge_plan.entry_net, hedge_plan.hedge_net,
-            )
-
-    # ── Phase 2: Take-profit ─────────────────────────────────────────────────
-
-    async def _check_take_profit(
-        self,
-        *,
-        snap: MarketSnapshot,
-        market_state,
-        position_side: Side,
-        unrealised_pct: float,
-        current_bid: float,
-        mode_tag: str,
-    ) -> None:
-        from brain import Phase1Status
-
-        position_token = market_state.position_token_id
-        position_shares = market_state.position_shares
-
-        if not position_token or position_shares <= 0:
-            return
+        actual_profit = fill.shares - fill.size
+        market_state.phase2_status = Phase2Status.EXECUTED
+        market_state.abort_reason = ""
+        market_state.position_source = "PHASE3"
+        market_state.position_side = entry_side
+        market_state.position_token_id = entry_token
+        market_state.phase2_bullets_fired = 1
+        market_state.phase2_spend = fill.size
 
         log.info(
-            "%s Phase 2 Take-Profit triggered | market=%s | side=%s"
-            " | unrealised=+%.1f%% | bid=%.4f",
-            mode_tag, market_state.market_label, position_side.value,
-            unrealised_pct, current_bid,
+            "%s SNIPER FILLED | market=%s | side=%s"
+            " | fill_price=%.4f | shares=%.4f | cost=$%.4f"
+            " | actual_profit=$%.4f | t=%.1fs",
+            mode_tag,
+            market_state.market_label,
+            fill.side,
+            fill.price,
+            fill.shares,
+            fill.size,
+            actual_profit,
+            snap.time_remaining,
         )
 
-        fill = await self._exec.execute_taker_sell(
-            condition_id=snap.condition_id,
-            market_label=market_state.market_label,
-            asset=snap.asset,
-            timeframe=snap.timeframe,
-            token_id=position_token,
-            side=position_side,
-            phase="PHASE2_TP",
-            target_shares=position_shares,
-            expected_fill_price=current_bid,
-        )
-
-        if fill:
-            market_state.phase1_status = Phase1Status.EXITED
-            market_state.phase1_detail = (
-                f"TP exit | bid={current_bid:.3f} | PnL=+{unrealised_pct:.1f}%"
-            )
-            log.info(
-                "%s Phase 2 TP FILLED | market=%s | price=%.4f | shares=%.4f | proceeds=$%.2f",
-                mode_tag, market_state.market_label,
-                fill.price, fill.shares, fill.size,
-            )
-
-    # ── Phase 2: Emergency close ─────────────────────────────────────────────
-
-    async def _phase2_emergency_close(
-        self,
-        *,
-        snap: MarketSnapshot,
-        market_state,
-        unrealised_pnl: float,
-        current_bid: float,
-        mode_tag: str,
-    ) -> None:
-        from brain import Phase1Status
-
-        position_side = market_state.position_side
-        position_token = market_state.position_token_id
-        position_shares = market_state.position_shares
-        tr = snap.time_remaining
-
-        if not position_token or position_shares <= 0:
-            return
-
-        # Hold if profitable — only close if losing
-        if unrealised_pnl >= 0:
-            market_state.phase1_status = Phase1Status.HOLD_TO_SETTLEMENT
-            market_state.phase1_detail = (
-                f"Hold to settlement | bid={current_bid:.3f} | PnL=+${unrealised_pnl:.4f} | t={tr:.0f}s"
-            )
-            return
-
-        log.info(
-            "%s Phase 2 Emergency Close | market=%s | side=%s"
-            " | unrealised_pnl=$%.4f | bid=%.4f | t=%.1fs",
-            mode_tag, market_state.market_label, position_side.value,
-            unrealised_pnl, current_bid, tr,
-        )
-
-        fill = await self._exec.execute_taker_sell(
-            condition_id=snap.condition_id,
-            market_label=market_state.market_label,
-            asset=snap.asset,
-            timeframe=snap.timeframe,
-            token_id=position_token,
-            side=position_side,
-            phase="PHASE2_EMERGENCY",
-            target_shares=position_shares,
-            expected_fill_price=current_bid,
-        )
-
-        if fill:
-            market_state.phase1_status = Phase1Status.EXITED
-            market_state.phase1_detail = (
-                f"Emergency exit | bid={current_bid:.3f} | t={tr:.0f}s"
-            )
-            log.info(
-                "%s Emergency Close FILLED | market=%s | price=%.4f | proceeds=$%.2f",
-                mode_tag, market_state.market_label, fill.price, fill.size,
-            )
-        else:
-            market_state.phase1_detail = (
-                f"Emergency close FAILED | bid={current_bid:.3f} | t={tr:.0f}s"
-            )
-
-    # ── Phase 3: Sniper ──────────────────────────────────────────────────────
-
+    # Legacy shim — no longer called from evaluate(); kept so any external
+    # integration tests that call _phase3_sniper directly still work.
     async def _phase3_sniper(
         self,
         *,
@@ -895,260 +639,21 @@ class StrategyExecutor:
         up_book,
         down_book,
     ) -> None:
-        from brain import Phase2Status
-
-        mode_tag = "[SIM]" if config.DRY_RUN else "[LIVE]"
-
-        # Gate 1: Oracle delta > SAFE_MARGIN
-        if not oracle_safe:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = (
-                f"Sniper: delta={delta_abs:.2f} ≤ margin={margin:.2f}"
-            )
-            log.debug(
-                "[SNIPER] Blocked-delta | market=%s | δ=%.2f ≤ margin=%.2f | t=%.0fs",
-                market_state.market_label, delta_abs, margin, snap.time_remaining,
-            )
+        if winning_side is None:
             return
-
-        # Gate 2: OBI aligned with oracle direction
-        if winning_side is None or obi_side is None or obi_side != winning_side:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = (
-                f"Sniper: OBI/oracle diverge"
-                f" | OBI={obi_side.value if obi_side else '-'}"
-                f" oracle={winning_side.value if winning_side else '-'}"
-            )
-            log.debug(
-                "[SNIPER] Blocked-OBI | market=%s | OBI_side=%s oracle=%s | OBI=%.3f | t=%.0fs",
-                market_state.market_label,
-                obi_side.value if obi_side else "-",
-                winning_side.value if winning_side else "-",
-                obi_value,
-                snap.time_remaining,
-            )
+        book = up_book if winning_side == Side.UP else down_book
+        if book is None:
             return
-
-        # Gate 3: Price in [0.96, 0.99] — high-conviction zone
-        entry_side = winning_side
-        sniper_book = up_book if entry_side == Side.UP else down_book
-        sniper_token = snap.up_token_id if entry_side == Side.UP else snap.down_token_id
-
-        if sniper_book is None or sniper_book.best_ask <= 0 or not sniper_token:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = "Sniper: no order book on sniper side"
-            return
-
-        current_price = sniper_book.best_ask
-
-        if current_price < PHASE3_MIN_WINNING_PRICE:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = (
-                f"Sniper: ask={current_price:.3f} < floor={PHASE3_MIN_WINNING_PRICE:.2f}"
-                f" — not in high-conviction zone yet"
-            )
-            log.debug(
-                "[SNIPER] Blocked-price | market=%s | ask=%.3f < floor=%.2f | t=%.0fs",
-                market_state.market_label, current_price,
-                PHASE3_MIN_WINNING_PRICE, snap.time_remaining,
-            )
-            return
-
-        if current_price > PHASE3_MAX_WINNING_PRICE:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = (
-                f"Sniper: ask={current_price:.3f} > ceiling={PHASE3_MAX_WINNING_PRICE:.2f}"
-                f" — overpaying risk"
-            )
-            log.debug(
-                "[SNIPER] Blocked-price | market=%s | ask=%.3f > ceiling=%.2f | t=%.0fs",
-                market_state.market_label, current_price,
-                PHASE3_MAX_WINNING_PRICE, snap.time_remaining,
-            )
-            return
-
-        # Gate 4: Momentum not slowing — OBI must still be strongly aligned
-        # UP  side: OBI ≥ PHASE3_MOMENTUM_OBI_STRONG (0.60)
-        # DOWN side: OBI ≤ 1 − 0.60 = 0.40
-        if entry_side == Side.UP:
-            momentum_ok = obi_value >= PHASE3_MOMENTUM_OBI_STRONG
-        else:
-            momentum_ok = obi_value <= (1.0 - PHASE3_MOMENTUM_OBI_STRONG)
-
-        if not momentum_ok:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = (
-                f"Sniper: momentum slowing | OBI={obi_value:.3f}"
-                f" side={entry_side.value}"
-                f" — required ≥{PHASE3_MOMENTUM_OBI_STRONG:.2f} (UP)"
-                f" / ≤{1.0 - PHASE3_MOMENTUM_OBI_STRONG:.2f} (DOWN)"
-            )
-            log.debug(
-                "[SNIPER] Blocked-momentum | market=%s | side=%s | OBI=%.3f | t=%.0fs",
-                market_state.market_label, entry_side.value, obi_value, snap.time_remaining,
-            )
-            return
-
-        # Gate 5: Positive expected profit
-        portfolio = await self._exec.get_portfolio_snapshot()
-        balance = portfolio.available_balance
-
-        if (entry_side == Side.UP and obi_value >= PHASE3_OBI_HIGH_THRESHOLD) or \
-           (entry_side == Side.DOWN and obi_value <= (1.0 - PHASE3_OBI_HIGH_THRESHOLD)):
-            size_ratio = PHASE3_SIZE_RATIO_HIGH
-        else:
-            size_ratio = PHASE3_SIZE_RATIO_BASE
-
-        sniper_size = math.floor((balance * size_ratio * 100.0) + 1e-9) / 100.0
-
-        if sniper_size < config.MIN_ORDER_USDC:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = (
-                f"Sniper: size=${sniper_size:.2f} below minimum ${config.MIN_ORDER_USDC:.2f}"
-            )
-            return
-
-        # Bump size up if ratio-based size yields fewer shares than exchange minimum.
-        # Avoids silent rejection from place_limit_order's MIN_ORDER_SHARES check.
-        min_size_for_shares = math.ceil(config.MIN_ORDER_SHARES * current_price * 100) / 100.0
-        if sniper_size < min_size_for_shares:
-            if min_size_for_shares > balance:
-                market_state.phase2_status = Phase2Status.BLOCKED
-                market_state.abort_reason = (
-                    f"Sniper: need ${min_size_for_shares:.2f} for {config.MIN_ORDER_SHARES} shares"
-                    f" but balance=${balance:.2f}"
-                )
-                return
-            sniper_size = min_size_for_shares
-
-        sniper_shares = sniper_size / current_price if current_price > 0 else 0.0
-        sniper_payout = sniper_shares * 1.00
-        expected_profit = sniper_payout - sniper_size
-
-        if expected_profit <= 0:
-            market_state.phase2_status = Phase2Status.BLOCKED
-            market_state.abort_reason = (
-                f"Sniper: expected_profit=${expected_profit:.4f} ≤ 0"
-            )
-            log.info(
-                "%s Phase 3 Sniper ABORTED — non-positive profit"
-                " | market=%s | ask=%.4f | size=$%.2f | payout=$%.4f | profit=$%.4f",
-                mode_tag,
-                market_state.market_label,
-                current_price, sniper_size, sniper_payout, expected_profit,
-            )
-            return
-
-        # ── All gates passed — place GTC limit order ─────────────────────────
-        target_shares = sniper_size / current_price
-
-        log.info(
-            "%s Phase 3 Sniper FIRED | market=%s | side=%s"
-            " | ask=%.4f | size=$%.2f (%.0f%% balance)"
-            " | shares=%.4f | expected_profit=$%.4f"
-            " | OBI=%.3f | δ=%.4f | t=%.1fs",
-            mode_tag,
-            market_state.market_label,
-            entry_side.value,
-            current_price,
-            sniper_size,
-            size_ratio * 100,
-            target_shares,
-            expected_profit,
-            obi_value,
-            snap.binance_live_price - snap.strike_price,
-            snap.time_remaining,
+        await self.execute_entry(
+            snap=snap,
+            market_state=market_state,
+            sstate=sstate,
+            entry_side=winning_side,
+            entry_book=book,
+            condition="legacy",
+            tr=snap.time_remaining,
+            obi_value=obi_value,
         )
-
-        order = await self._exec.place_limit_order(
-            condition_id=snap.condition_id,
-            market_label=market_state.market_label,
-            asset=snap.asset,
-            timeframe=snap.timeframe,
-            token_id=sniper_token,
-            side=entry_side,
-            price=current_price,
-            size_usdc=sniper_size,
-            phase="PHASE3_SNIPER",
-        )
-
-        if order is None:
-            market_state.phase2_status = Phase2Status.ABORTED
-            market_state.abort_reason = "Sniper: limit order rejected"
-            log.info(
-                "%s Phase 3 Sniper REJECTED | market=%s | side=%s | ask=%.4f | size=$%.2f | t=%.1fs",
-                mode_tag, market_state.market_label, entry_side.value,
-                current_price, sniper_size, snap.time_remaining,
-            )
-            return
-
-        sstate.phase3_sniper_fired = True
-
-        sstate.phase3_order_id = order.order_id
-        log.info(
-            "%s Phase 3 Sniper LIMIT PLACED | market=%s | side=%s"
-            " | ask=%.4f | size=$%.2f | order=%s | t=%.1fs",
-            mode_tag, market_state.market_label, entry_side.value,
-            current_price, sniper_size, order.order_id[:12], snap.time_remaining,
-        )
-
-        # Poll for fill up to PHASE3_LIMIT_TIMEOUT seconds
-        best_ask_up = current_price if entry_side == Side.UP else 0.0
-        best_ask_down = current_price if entry_side == Side.DOWN else 0.0
-        deadline = time.time() + PHASE3_LIMIT_TIMEOUT
-        fill: Optional[Fill] = None
-
-        while time.time() < deadline:
-            fills = await self._exec.process_limit_crosses(
-                condition_id=snap.condition_id,
-                market_label=market_state.market_label,
-                asset=snap.asset,
-                timeframe=snap.timeframe,
-                best_ask_up=best_ask_up,
-                best_ask_down=best_ask_down,
-            )
-            if fills:
-                fill = fills[0]
-                break
-            open_orders = self._exec.get_open_orders(snap.condition_id)
-            if not any(o.order_id == order.order_id for o in open_orders):
-                break
-            await asyncio.sleep(PHASE3_LIMIT_POLL_INTERVAL)
-
-        if fill is None:
-            await self._exec.cancel_order(order.order_id)
-            sstate.phase3_order_id = ""
-            market_state.phase2_status = Phase2Status.ABORTED
-            market_state.abort_reason = "Sniper limit not filled — timed out"
-            log.info(
-                "%s Phase 3 Sniper TIMEOUT | market=%s | side=%s | ask=%.4f | size=$%.2f | t=%.1fs",
-                mode_tag, market_state.market_label, entry_side.value,
-                current_price, sniper_size, snap.time_remaining,
-            )
-        else:
-            actual_profit = fill.shares - fill.size
-            market_state.phase2_status = Phase2Status.EXECUTED
-            market_state.abort_reason = ""
-            market_state.position_source = "PHASE3"
-            market_state.position_side = entry_side
-            market_state.position_token_id = sniper_token
-            market_state.phase2_bullets_fired = 1
-            market_state.phase2_spend = fill.size
-            sstate.phase3_order_id = ""
-
-            log.info(
-                "%s Phase 3 Sniper FILLED | market=%s | side=%s"
-                " | fill_price=%.4f | shares=%.4f | cost=$%.4f"
-                " | actual_profit=$%.4f | t=%.1fs",
-                mode_tag,
-                market_state.market_label,
-                fill.side,
-                fill.price,
-                fill.shares,
-                fill.size,
-                actual_profit,
-                snap.time_remaining,
-            )
 
     # ── Accessors ────────────────────────────────────────────────────────────
 

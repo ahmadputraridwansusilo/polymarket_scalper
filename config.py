@@ -356,6 +356,39 @@ SNIPER_SLIPPAGE_ESTIMATE: float = float(os.getenv("SNIPER_SLIPPAGE_ESTIMATE", "0
 SNIPER_MIN_PROFIT_RATIO: float = float(os.getenv("SNIPER_MIN_PROFIT_RATIO", "0.03"))
 
 # ---------------------------------------------------------------------------
+# Phase 3 Sniper — per-spec sizing and cost model (2026 refactor)
+# ---------------------------------------------------------------------------
+# Fixed USDC position size; never size by balance ratio in Phase 3.
+# SNIPER_PRICE_MIN / MAX stored as integer cents in .env (95 → 0.95).
+SNIPER_POSITION_SIZE_USD: float = float(os.getenv("SNIPER_POSITION_SIZE_USD", "5.0"))
+SNIPER_PRICE_MIN: float = float(os.getenv("SNIPER_PRICE_MIN", "90")) / 100.0   # 0.95
+SNIPER_PRICE_MAX: float = float(os.getenv("SNIPER_PRICE_MAX", "98")) / 100.0   # 0.99
+SNIPER_EARLY_WINDOW_SEC: float = float(os.getenv("SNIPER_EARLY_WINDOW_SEC", "90"))
+SNIPER_LATE_WINDOW_SEC: float = float(os.getenv("SNIPER_LATE_WINDOW_SEC", "30"))
+# Profit gate cost model — dynamic taker fee for 15-min crypto markets.
+# Polymarket fee peaks near 50/50 probability and approaches 0 at extremes.
+# Formula: fee_rate(p) = 4 * p * (1-p) * PEAK_FEE_RATE
+# At p=0.50: fee ≈ 2.0%  At p=0.90: fee ≈ 0.72%  At p=0.95: fee ≈ 0.38%
+PEAK_FEE_RATE: float = float(os.getenv("PEAK_FEE_RATE", "0.02"))
+
+
+def dynamic_fee_rate(price: float) -> float:
+    """Polymarket dynamic taker fee: peaks at p=0.5, zero at p=0 or p=1."""
+    return 4.0 * price * (1.0 - price) * PEAK_FEE_RATE
+
+# ---------------------------------------------------------------------------
+# Claim / settlement retry
+# ---------------------------------------------------------------------------
+CLAIM_MAX_RETRIES: int = int(os.getenv("CLAIM_MAX_RETRIES", "3"))
+CLAIM_RETRY_DELAY_SEC: float = float(os.getenv("CLAIM_RETRY_DELAY_SEC", "5"))
+
+# Startup guard — fail fast rather than silently mis-size.
+if SNIPER_POSITION_SIZE_USD <= 0:
+    raise ValueError(
+        f"SNIPER_POSITION_SIZE_USD must be > 0, got {SNIPER_POSITION_SIZE_USD}"
+    )
+
+# ---------------------------------------------------------------------------
 # Probability model — Level 2 (Lognormal / Black-Scholes)
 # ---------------------------------------------------------------------------
 # Compares real-market probability (from Binance price + vol) against

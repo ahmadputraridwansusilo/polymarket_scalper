@@ -567,12 +567,12 @@ async def trace_phase3_sniper() -> None:
     )
 
     sstate = executor.get_strategy_state(snap.condition_id)
-    log.info("[TRACE] phase3_sniper_fired: %s",
-             sstate.phase3_sniper_fired if sstate else "N/A")
+    log.info("[TRACE] sniper_entered: %s",
+             sstate.sniper_entered if sstate else "N/A")
     log.info("[TRACE] phase2_status: %s | abort_reason: %s",
              market_state.phase2_status, market_state.abort_reason)
 
-    if sstate and sstate.phase3_sniper_fired:
+    if sstate and sstate.sniper_entered:
         portfolio = await exec_mgr.get_portfolio_snapshot()
         pos_map = portfolio.active_positions.get(snap.condition_id, {})
         if "UP" in pos_map:

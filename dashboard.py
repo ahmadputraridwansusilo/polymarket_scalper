@@ -489,8 +489,8 @@ class Dashboard:
                 auto_refresh=False,
                 refresh_per_second=1,
                 vertical_overflow="crop",
-                redirect_stdout=False,
-                redirect_stderr=False,
+                redirect_stdout=True,
+                redirect_stderr=True,
             ) as live:
                 refresh_task: asyncio.Task | None = None
                 while True:
